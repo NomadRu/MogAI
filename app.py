@@ -35,9 +35,20 @@ GROQ_KEY = os.environ.get("GROQ_API_KEY")
 if not TOKEN or not GROQ_KEY:
     raise ValueError("Не заданы TELEGRAM_TOKEN или GROQ_API_KEY!")
 
-# Модели Groq
-GROQ_TEXT_MODEL = "llama-3.3-70b-versatile" # Отличная текстовая модель
-GROQ_VISION_MODEL = "llama-3.2-11b-vision-preview" # Модель, которая видит картинки
+# --- СПИСКИ МОДЕЛЕЙ GROQ (от новых к старым) ---
+# Если модель удалили, бот попробует следующую
+GROQ_TEXT_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-70b-versatile",
+    "llama3-70b-8192",
+    "mixtral-8x7b-32768"
+]
+
+GROQ_VISION_MODELS = [
+    "llama-3.2-11b-vision-preview",
+    "llama-3.2-90b-vision-preview"
+]
+
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # --- КЛАВИАТУРЫ ---
@@ -137,27 +148,29 @@ def ask_groq_text(messages: list) -> str:
     for msg in messages[-8:]:
         or_messages.append({"role": msg["role"], "content": msg["content"]})
 
-    try:
-        response = requests.post(
-            url=GROQ_API_URL,
-            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": GROQ_TEXT_MODEL,
-                "messages": or_messages,
-                "max_tokens": 3000
-            },
-            timeout=40
-        )
-        data = response.json()
-        
-        if "error" in data:
-            logger.error(f"Ошибка Groq: {data['error']}")
-            return f"⚠️ Ошибка Groq: {data['error'].get('message')}"
+    last_error = "Модель не найдена"
+    for model in GROQ_TEXT_MODELS:
+        try:
+            response = requests.post(
+                url=GROQ_API_URL,
+                headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+                json={"model": model, "messages": or_messages, "max_tokens": 3000},
+                timeout=40
+            )
+            data = response.json()
             
-        return data["choices"][0]["message"]["content"]
-    except Exception as e:
-        logger.error(f"Сбой Groq: {e}")
-        return f"⚠️ Сбой Groq: {e}"
+            if "error" not in data and "choices" in data:
+                return data["choices"][0]["message"]["content"]
+            
+            err_msg = data.get("error", {}).get("message", "")
+            last_error = err_msg
+            logger.warning(f"Модель {model} не сработала: {err_msg}")
+            
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    return f"⚠️ Ошибка Groq: {last_error}"
 
 def ask_groq_vision(image_b64: str, user_text: str, history: list) -> str:
     messages = []
@@ -172,27 +185,29 @@ def ask_groq_vision(image_b64: str, user_text: str, history: list) -> str:
         ]
     })
 
-    try:
-        response = requests.post(
-            url=GROQ_API_URL,
-            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": GROQ_VISION_MODEL,
-                "messages": messages,
-                "max_tokens": 3000
-            },
-            timeout=60
-        )
-        data = response.json()
-        
-        if "error" in data:
-            logger.error(f"Ошибка Groq (фото): {data['error']}")
-            return f"⚠️ Ошибка Groq (фото): {data['error'].get('message')}"
+    last_error = "Vision-модель не найдена"
+    for model in GROQ_VISION_MODELS:
+        try:
+            response = requests.post(
+                url=GROQ_API_URL,
+                headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+                json={"model": model, "messages": messages, "max_tokens": 3000},
+                timeout=60
+            )
+            data = response.json()
             
-        return data["choices"][0]["message"]["content"]
-    except Exception as e:
-        logger.error(f"Сбой Groq (фото): {e}")
-        return f"⚠️ Сбой Groq (фото): {e}"
+            if "error" not in data and "choices" in data:
+                return data["choices"][0]["message"]["content"]
+                
+            err_msg = data.get("error", {}).get("message", "")
+            last_error = err_msg
+            logger.warning(f"Vision-модель {model} не сработала: {err_msg}")
+
+        except Exception as e:
+            last_error = str(e)
+            continue
+            
+    return f"⚠️ Ошибка Groq (фото): {last_error}"
 
 # --- СОЗДАНИЕ РЕФЕРАТА ---
 def create_gost_document(topic: str) -> io.BytesIO:
