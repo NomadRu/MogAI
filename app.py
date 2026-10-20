@@ -30,16 +30,15 @@ logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 URL = os.environ.get("RENDER_EXTERNAL_URL")
-ZAI_KEY = os.environ.get("ZAI_API_KEY")
+GROQ_KEY = os.environ.get("GROQ_API_KEY")
 
-if not TOKEN or not ZAI_KEY:
-    raise ValueError("Не заданы TELEGRAM_TOKEN или ZAI_API_KEY!")
+if not TOKEN or not GROQ_KEY:
+    raise ValueError("Не заданы TELEGRAM_TOKEN или GROQ_API_KEY!")
 
-# Модели Z.Ai. 
-# Модели Z.Ai (бесплатные)
-ZAI_TEXT_MODEL = "glm-4.5-flash"  # Текстовая модель
-ZAI_VISION_MODEL = "glm-4.6v-flash" # Модель, которая видит картинки
-ZAI_API_URL = "https://api.z.ai/api/paas/v4/chat/completions"
+# Модели Groq
+GROQ_TEXT_MODEL = "llama-3.3-70b-versatile" # Отличная текстовая модель
+GROQ_VISION_MODEL = "llama-3.2-11b-vision-preview" # Модель, которая видит картинки
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # --- КЛАВИАТУРЫ ---
 def get_main_keyboard():
@@ -132,19 +131,18 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: await query.edit_message_text("⏹ <b>Запрос отменён.</b>", parse_mode="HTML")
     except Exception: pass
 
-# --- ЗАПРОСЫ К Z.AI ---
-def ask_zai_text(messages: list) -> str:
-    # Формируем историю
+# --- ЗАПРОСЫ К GROQ ---
+def ask_groq_text(messages: list) -> str:
     or_messages = [{"role": "system", "content": "Ты — MogAI. Отвечай текстом. Используй таблицы (Markdown), если попросят."}]
     for msg in messages[-8:]:
         or_messages.append({"role": msg["role"], "content": msg["content"]})
 
     try:
         response = requests.post(
-            url=ZAI_API_URL,
-            headers={"Authorization": f"Bearer {ZAI_KEY}", "Content-Type": "application/json"},
+            url=GROQ_API_URL,
+            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
             json={
-                "model": ZAI_TEXT_MODEL,
+                "model": GROQ_TEXT_MODEL,
                 "messages": or_messages,
                 "max_tokens": 3000
             },
@@ -153,16 +151,15 @@ def ask_zai_text(messages: list) -> str:
         data = response.json()
         
         if "error" in data:
-            logger.error(f"Ошибка Z.Ai (текст): {data['error']}")
-            return f"⚠️ Ошибка Z.Ai: {data['error'].get('message')}"
+            logger.error(f"Ошибка Groq: {data['error']}")
+            return f"⚠️ Ошибка Groq: {data['error'].get('message')}"
             
         return data["choices"][0]["message"]["content"]
     except Exception as e:
-        logger.error(f"Сбой Z.Ai: {e}")
-        return f"⚠️ Сбой Z.Ai: {e}"
+        logger.error(f"Сбой Groq: {e}")
+        return f"⚠️ Сбой Groq: {e}"
 
-def ask_zai_vision(image_b64: str, user_text: str, history: list) -> str:
-    # Формируем сообщение с картинкой в формате OpenAI
+def ask_groq_vision(image_b64: str, user_text: str, history: list) -> str:
     messages = []
     for msg in history[-4:]:
         messages.append({"role": msg["role"], "content": msg["content"]})
@@ -177,10 +174,10 @@ def ask_zai_vision(image_b64: str, user_text: str, history: list) -> str:
 
     try:
         response = requests.post(
-            url=ZAI_API_URL,
-            headers={"Authorization": f"Bearer {ZAI_KEY}", "Content-Type": "application/json"},
+            url=GROQ_API_URL,
+            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
             json={
-                "model": ZAI_VISION_MODEL,
+                "model": GROQ_VISION_MODEL,
                 "messages": messages,
                 "max_tokens": 3000
             },
@@ -189,15 +186,15 @@ def ask_zai_vision(image_b64: str, user_text: str, history: list) -> str:
         data = response.json()
         
         if "error" in data:
-            logger.error(f"Ошибка Z.Ai (фото): {data['error']}")
-            return f"⚠️ Ошибка Z.Ai (фото): {data['error'].get('message')}"
+            logger.error(f"Ошибка Groq (фото): {data['error']}")
+            return f"⚠️ Ошибка Groq (фото): {data['error'].get('message')}"
             
         return data["choices"][0]["message"]["content"]
     except Exception as e:
-        logger.error(f"Сбой Z.Ai (фото): {e}")
-        return f"⚠️ Сбой Z.Ai (фото): {e}"
+        logger.error(f"Сбой Groq (фото): {e}")
+        return f"⚠️ Сбой Groq (фото): {e}"
 
-# --- СОЗДАНИЕ РЕФЕРАТА (ЧЕРЕЗ Z.AI) ---
+# --- СОЗДАНИЕ РЕФЕРАТА ---
 def create_gost_document(topic: str) -> io.BytesIO:
     prompt = (
         f"Напиши текст для реферата на тему: '{topic}'. "
@@ -205,8 +202,7 @@ def create_gost_document(topic: str) -> io.BytesIO:
         "Пиши чистым текстом без Markdown. Заголовки пиши ЗАГЛАВНЫМИ буквами."
     )
     
-    # Просим текст у Z.Ai
-    raw_text = ask_zai_text([{"role": "user", "content": prompt}])
+    raw_text = ask_groq_text([{"role": "user", "content": prompt}])
     
     if not raw_text or "⚠️" in raw_text: return None
 
@@ -282,7 +278,7 @@ async def send_safe_message(update: Update, text: str):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["history"] = []
     text = (
-        "👋 <b>Привет! Я MogAI (на базе Z.Ai).</b>\n\n"
+        "👋 <b>Привет! Я MogAI (на базе Groq).</b>\n\n"
         "Я умею:\n"
         "💬 Отвечать на вопросы\n"
         "📊 <b>Создавать таблицы</b> (PNG)\n"
@@ -334,7 +330,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         caption=f"📝 Реферат по ГОСТу: <b>{topic}</b>", parse_mode="HTML"
                     )
                 else: 
-                    await update.message.reply_text("⚠️ Не удалось создать реферат (ошибка Z.Ai).")
+                    await update.message.reply_text("⚠️ Не удалось создать реферат (ошибка Groq).")
             finally:
                 stop_event.set(); await anim
             return
@@ -346,7 +342,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             history.append({"role": "user", "content": user_text})
             if len(history) > 8: history = history[-8:]
             
-            ai_response = await asyncio.to_thread(ask_zai_text, history)
+            ai_response = await asyncio.to_thread(ask_groq_text, history)
             
             if stop_event.is_set(): return
             history.append({"role": "assistant", "content": ai_response})
@@ -372,7 +368,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption = update.message.caption or "Что на фото?"
             history = context.user_data.get("history", [])
             
-            ai_response = await asyncio.to_thread(ask_zai_vision, image_b64, caption, history)
+            ai_response = await asyncio.to_thread(ask_groq_vision, image_b64, caption, history)
             
             if stop_event.is_set(): return
             history.append({"role": "user", "content": f"[Фото] {caption}"})
