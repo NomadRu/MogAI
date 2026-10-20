@@ -30,23 +30,15 @@ logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 URL = os.environ.get("RENDER_EXTERNAL_URL")
-OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
+ZAI_KEY = os.environ.get("ZAI_API_KEY")
 
-if not TOKEN:
-    raise ValueError("Не задан TELEGRAM_TOKEN!")
+if not TOKEN or not ZAI_KEY:
+    raise ValueError("Не заданы TELEGRAM_TOKEN или ZAI_API_KEY!")
 
-# Собираем все ключи Google (от 1 до 5)
-def get_gemini_keys():
-    keys = []
-    for i in range(1, 6):
-        key = os.environ.get(f"GEMINI_KEY_{i}")
-        if key:
-            keys.append(key)
-    return keys
-
-GEMINI_TEXT_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
-GEMINI_VISION_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
-GEMINI_PROXY = "https://gemini-proxy.bold-violet-3c8d.workers.dev"
+# Модели Z.Ai. 
+ZAI_TEXT_MODEL = "glm-4-flash"  # Быстрая текстовая модель
+ZAI_VISION_MODEL = "glm-4v-flash" # Модель, которая видит картинки
+ZAI_API_URL = "https://api.z.ai/api/paas/v4/chat/completions"
 
 # --- КЛАВИАТУРЫ ---
 def get_main_keyboard():
@@ -139,70 +131,72 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: await query.edit_message_text("⏹ <b>Запрос отменён.</b>", parse_mode="HTML")
     except Exception: pass
 
-# --- УМНЫЕ ЗАПРОСЫ С ПЕРЕБОРОМ КЛЮЧЕЙ ---
-def ask_gemini_text(messages: list) -> str:
-    contents = []
-    system_instruction = "Ты — MogAI. Отвечай обычным текстом. Используй таблицы ТОЛЬКО если попросили."
-    contents.append({"role": "user", "parts": [{"text": system_instruction}]})
-    for msg in messages:
-        role = "user" if msg["role"] == "user" else "model"
-        contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+# --- ЗАПРОСЫ К Z.AI ---
+def ask_zai_text(messages: list) -> str:
+    # Формируем историю
+    or_messages = [{"role": "system", "content": "Ты — MogAI. Отвечай текстом. Используй таблицы (Markdown), если попросят."}]
+    for msg in messages[-8:]:
+        or_messages.append({"role": msg["role"], "content": msg["content"]})
 
-    keys = get_gemini_keys()
-    if not keys:
-        return ask_openrouter_text(messages)
-
-    for key_index, key in enumerate(keys):
-        for model in GEMINI_TEXT_MODELS:
-            url = f"{GEMINI_PROXY}/v1beta/models/{model}:generateContent?key={key}"
-            try:
-                response = requests.post(url=url, headers={"Content-Type": "application/json"}, 
-                    json={"contents": contents, "generationConfig": {"maxOutputTokens": 3000}}, timeout=20)
-                data = response.json()
-                
-                if "error" not in data and "candidates" in data:
-                    return data["candidates"][0]["content"]["parts"][0]["text"]
-                
-                if data.get("error", {}).get("code") == 429:
-                    logger.warning(f"Ключ №{key_index + 1} исчерпан. Переключаюсь...")
-                    break # Переходим к следующему ключу
-            except Exception: continue
-
-    logger.warning("Все ключи Google исчерпаны. Иду в OpenRouter.")
-    return ask_openrouter_text(messages)
-
-def ask_gemini_vision(image_b64: str, user_text: str) -> str:
-    keys = get_gemini_keys()
-    if not keys: return "⚠️ Нет ключей Google."
-
-    for key_index, key in enumerate(keys):
-        for model in GEMINI_VISION_MODELS:
-            url = f"{GEMINI_PROXY}/v1beta/models/{model}:generateContent?key={key}"
-            try:
-                response = requests.post(url=url, headers={"Content-Type": "application/json"}, 
-                    json={"contents": [{"parts": [{"text": user_text}, {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}}]}]}, timeout=40)
-                data = response.json()
-                if "error" not in data and "candidates" in data:
-                    return data["candidates"][0]["content"]["parts"][0]["text"]
-                if data.get("error", {}).get("code") == 429:
-                    break # Следующий ключ
-            except Exception: continue
-    return "⚠️ Все ключи Google для фото исчерпаны."
-
-def ask_openrouter_text(messages: list) -> str:
-    if not OPENROUTER_KEY: return "⚠️ Все ключи Google исчерпаны, а OpenRouter не настроен."
-    or_messages = [{"role": "system", "content": "Ты — MogAI. Отвечай текстом."}]
-    for msg in messages[-6:]: or_messages.append({"role": msg["role"], "content": msg["content"]})
     try:
-        response = requests.post("https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"},
-            json={"model": "openrouter/free", "messages": or_messages, "max_tokens": 3000}, timeout=30)
+        response = requests.post(
+            url=ZAI_API_URL,
+            headers={"Authorization": f"Bearer {ZAI_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": ZAI_TEXT_MODEL,
+                "messages": or_messages,
+                "max_tokens": 3000
+            },
+            timeout=40
+        )
         data = response.json()
-        if "error" in data: return f"⚠️ OpenRouter: {data['error'].get('message')}"
+        
+        if "error" in data:
+            logger.error(f"Ошибка Z.Ai (текст): {data['error']}")
+            return f"⚠️ Ошибка Z.Ai: {data['error'].get('message')}"
+            
         return data["choices"][0]["message"]["content"]
-    except Exception as e: return f"⚠️ Сбой: {e}"
+    except Exception as e:
+        logger.error(f"Сбой Z.Ai: {e}")
+        return f"⚠️ Сбой Z.Ai: {e}"
 
-# --- СОЗДАНИЕ РЕФЕРАТА (С ПЕРЕБОРОМ КЛЮЧЕЙ) ---
+def ask_zai_vision(image_b64: str, user_text: str, history: list) -> str:
+    # Формируем сообщение с картинкой в формате OpenAI
+    messages = []
+    for msg in history[-4:]:
+        messages.append({"role": msg["role"], "content": msg["content"]})
+        
+    messages.append({
+        "role": "user",
+        "content": [
+            {"type": "text", "text": user_text or "Что на фото?"},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
+        ]
+    })
+
+    try:
+        response = requests.post(
+            url=ZAI_API_URL,
+            headers={"Authorization": f"Bearer {ZAI_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": ZAI_VISION_MODEL,
+                "messages": messages,
+                "max_tokens": 3000
+            },
+            timeout=60
+        )
+        data = response.json()
+        
+        if "error" in data:
+            logger.error(f"Ошибка Z.Ai (фото): {data['error']}")
+            return f"⚠️ Ошибка Z.Ai (фото): {data['error'].get('message')}"
+            
+        return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.error(f"Сбой Z.Ai (фото): {e}")
+        return f"⚠️ Сбой Z.Ai (фото): {e}"
+
+# --- СОЗДАНИЕ РЕФЕРАТА (ЧЕРЕЗ Z.AI) ---
 def create_gost_document(topic: str) -> io.BytesIO:
     prompt = (
         f"Напиши текст для реферата на тему: '{topic}'. "
@@ -210,42 +204,11 @@ def create_gost_document(topic: str) -> io.BytesIO:
         "Пиши чистым текстом без Markdown. Заголовки пиши ЗАГЛАВНЫМИ буквами."
     )
     
-    raw_text = ""
-    keys = get_gemini_keys()
+    # Просим текст у Z.Ai
+    raw_text = ask_zai_text([{"role": "user", "content": prompt}])
+    
+    if not raw_text or "⚠️" in raw_text: return None
 
-    # Ищем текст в Google
-    for key_index, key in enumerate(keys):
-        for model in GEMINI_TEXT_MODELS:
-            url = f"{GEMINI_PROXY}/v1beta/models/{model}:generateContent?key={key}"
-            try:
-                response = requests.post(url=url, headers={"Content-Type": "application/json"}, 
-                    json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 4000}}, timeout=60)
-                data = response.json()
-                if "error" not in data and "candidates" in data:
-                    raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-                    break
-                if data.get("error", {}).get("code") == 429:
-                    break 
-            except Exception: continue
-        if raw_text: break
-
-    # Если Google не смог, идем в OpenRouter
-    if not raw_text and OPENROUTER_KEY:
-        try:
-            response = requests.post(
-                url="https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"},
-                json={"model": "openrouter/free", "messages": [{"role": "user", "content": prompt}], "max_tokens": 4000},
-                timeout=90
-            )
-            data = response.json()
-            if "error" not in data and "choices" in data:
-                raw_text = data["choices"][0]["message"]["content"]
-        except Exception: pass
-
-    if not raw_text: return None
-
-    # Очистка и сборка Word
     raw_text = re.sub(r'[*#_`~]', '', raw_text)
     raw_text = "".join(c for c in raw_text if c.isprintable() or c in '\n\r\t')
 
@@ -318,7 +281,7 @@ async def send_safe_message(update: Update, text: str):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["history"] = []
     text = (
-        "👋 <b>Привет! Я MogAI.</b>\n\n"
+        "👋 <b>Привет! Я MogAI (на базе Z.Ai).</b>\n\n"
         "Я умею:\n"
         "💬 Отвечать на вопросы\n"
         "📊 <b>Создавать таблицы</b> (PNG)\n"
@@ -370,7 +333,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         caption=f"📝 Реферат по ГОСТу: <b>{topic}</b>", parse_mode="HTML"
                     )
                 else: 
-                    await update.message.reply_text("⚠️ Не удалось создать реферат. Лимиты исчерпаны.")
+                    await update.message.reply_text("⚠️ Не удалось создать реферат (ошибка Z.Ai).")
             finally:
                 stop_event.set(); await anim
             return
@@ -381,7 +344,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             history = context.user_data.get("history", [])
             history.append({"role": "user", "content": user_text})
             if len(history) > 8: history = history[-8:]
-            ai_response = await asyncio.to_thread(ask_gemini_text, history)
+            
+            ai_response = await asyncio.to_thread(ask_zai_text, history)
+            
             if stop_event.is_set(): return
             history.append({"role": "assistant", "content": ai_response})
             context.user_data["history"] = history
@@ -405,7 +370,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             image_b64 = base64.b64encode(file_bytes).decode("utf-8")
             caption = update.message.caption or "Что на фото?"
             history = context.user_data.get("history", [])
-            ai_response = await asyncio.to_thread(ask_gemini_vision, image_b64, caption)
+            
+            ai_response = await asyncio.to_thread(ask_zai_vision, image_b64, caption, history)
+            
             if stop_event.is_set(): return
             history.append({"role": "user", "content": f"[Фото] {caption}"})
             history.append({"role": "assistant", "content": ai_response})
