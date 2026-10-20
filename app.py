@@ -5,6 +5,9 @@ import logging
 import io
 import asyncio
 import re
+import matplotlib
+matplotlib.use('Agg') # Важно для работы на сервере без экрана
+import matplotlib.pyplot as plt
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, 
@@ -43,45 +46,63 @@ def get_reset_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# --- УМНАЯ КОНВЕРТАЦИЯ ТАБЛИЦЫ В CSV ---
-def markdown_to_csv(text: str) -> str:
-    """Находит Markdown-таблицу в тексте и превращает в нормальный CSV"""
+# --- РИСОВАНИЕ ТАБЛИЦЫ В PNG ---
+def markdown_to_png(text: str) -> io.BytesIO:
     lines = text.split('\n')
-    csv_lines = []
-    in_table = False
+    table_data = []
     
     for line in lines:
-        # Если строка похожа на часть таблицы
-        if "|" in line and not line.strip().startswith('```'):
-            in_table = True
-            # Очищаем от крайних палок и разбиваем по палкам
-            parts = [part.strip() for part in line.strip().strip('|').split('|')]
-            
-            # Пропускаем строки-разделители (типа |---|---|)
-            if all(re.match(r'^:?-+:?$', p) for p in parts):
+        clean_line = line.strip()
+        if "|" in clean_line and not clean_line.startswith('```'):
+            parts = [part.strip() for part in clean_line.strip('|').split('|')]
+            # Пропускаем разделители
+            if all(re.match(r'^:?-+:?$', p) for p in parts if p):
                 continue
-                
-            # Оборачиваем в кавычки на случай, если внутри есть запятые
-            csv_line = ",".join([f'"{p}"' for p in parts])
-            csv_lines.append(csv_line)
-        elif in_table and line.strip() == "":
-            in_table = False
-            
-    if csv_lines:
-        return "\n".join(csv_lines)
-    return ""
+            table_data.append(parts)
+    
+    if not table_data:
+        return None
 
-# --- ЧИСТИЛЬЩИК ТЕКСТА ---
-def format_text_for_telegram(text: str) -> str:
-    # Сначала вырезаем код, чтобы его не испортить
+    # Настройка графика
+    fig, ax = plt.subplots(figsize=(10, max(2, len(table_data) * 0.5)))
+    ax.axis('tight')
+    ax.axis('off')
+    
+    # Рисуем таблицу (первая строка - заголовки)
+    table = ax.table(cellText=table_data[1:], colLabels=table_data[0], cellLoc='center', loc='center')
+    
+    # Красивое оформление
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1.2, 1.5)
+    
+    # Делаем заголовки жирными и с фоном
+    for (row, col), cell in table.get_celld().items():
+        if row == 0:
+            cell.set_text_props(weight='bold', color='white')
+            cell.set_facecolor('#4a4a4a')
+        else:
+            cell.set_facecolor('#f0f0f0' if row % 2 == 0 else 'white')
+
+    # Сохраняем в буфер
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight', dpi=200)
+    buf.seek(0)
+    plt.close(fig) # Обязательно закрываем фигуру, чтобы не забивать память
+    return buf
+
+# --- ЧИСТИЛЬЩИК ТЕКСТА И КОДА ---
+def format_text_for_telegram(text: str):
     code_blocks = []
     def save_code_block(match):
-        code_blocks.append(match.group(0))
-        return f"__CODE_PLACEHOLDER_{len(code_blocks)-1}__"
+        lang = match.group(1).strip() if match.group(1) else ""
+        code = match.group(2)
+        code_blocks.append((lang, code))
+        return f"%%%CODE_BLOCK_{len(code_blocks)-1}%%%"
     
-    text = re.sub(r'```[\s\S]*?```', save_code_block, text)
+    text = re.sub(r'```([a-zA-Z0-9]*)\n([\s\S]*?)```', save_code_block, text)
     
-    # Убираем Markdown-таблицы из текста (они уйдут в файл)
+    # Убираем Markdown-таблицы
     text = re.sub(r'(\|.*\|)', '', text)
     text = re.sub(r'(-{3,}.*)', '', text)
     
@@ -94,25 +115,16 @@ def format_text_for_telegram(text: str) -> str:
     # Заголовки
     text = re.sub(r'^#{1,6}\s+(.*)$', r'<b>\1</b>', text, flags=re.MULTILINE)
     
-    # Возвращаем код обратно
-    for i, block in enumerate(code_blocks):
-        clean_code = block.replace('```', '').strip()
-        lines = clean_code.split('\n')
-        if lines and lines[0].strip() in ['python', 'html', 'javascript', 'css', 'json', 'sql', 'cpp', 'java', 'php', 'bash']:
-            lines = lines[1:]
-        
-        # ВАЖНО: Экранируем код, чтобы теги внутри не сломали HTML
-        safe_code = '\n'.join(lines).replace('&', '&amp;').replace('>', '&gt;').replace('<', '&lt;')
-        html_code = f"<pre><code>{safe_code}</code></pre>"
-        text = text.replace(f"__CODE_PLACEHOLDER_{i}__", html_code)
-        
-    # Экранируем опасные символы в основном тексте
+    # Экранируем HTML
     text = text.replace('&', '&amp;').replace('>', '&gt;').replace('<', '&lt;')
-    
-    # Возвращаем наши HTML-теги
     for tag in ['b', 'i', 's', 'code', 'pre']:
         text = text.replace(f'&lt;{tag}&gt;', f'<{tag}>').replace(f'&lt;/{tag}&gt;', f'</{tag}>')
     
+    for i, (lang, code) in enumerate(code_blocks):
+        safe_code = code.replace('&', '&amp;').replace('>', '&gt;').replace('<', '&lt;')
+        html_code = f"<pre><code class=\"language-{lang}\">{safe_code}</code></pre>"
+        text = text.replace(f"%%%CODE_BLOCK_{i}%%%", html_code)
+        
     return text
 
 # --- АНИМАЦИЯ ---
@@ -123,71 +135,44 @@ async def animate_thinking(update: Update, stop_event: asyncio.Event):
         while not stop_event.is_set():
             await asyncio.sleep(2)
             seconds += 2
-            if stop_event.is_set():
-                break
+            if stop_event.is_set(): break
             try:
                 await msg.edit_text(f"⏳ <b>MogAI думает...</b> ({seconds} сек)", parse_mode="HTML")
-            except Exception:
-                pass
-        try:
-            await msg.delete()
-        except Exception:
-            pass
-    except Exception:
-        pass
+            except Exception: pass
+        try: await msg.delete()
+        except Exception: pass
+    except Exception: pass
 
 # --- ЗАПРОСЫ ---
 def ask_openrouter_text(messages: list) -> str:
-    if not OPENROUTER_KEY:
-        return "⚠️ Для резервной модели нужен OPENROUTER_API_KEY."
-    
+    if not OPENROUTER_KEY: return "⚠️ Нужен OPENROUTER_API_KEY."
     or_messages = [{"role": "system", "content": "Ты — MogAI. Отвечай текстом."}]
-    for msg in messages[-6:]:
-        or_messages.append({"role": msg["role"], "content": msg["content"]})
-    
+    for msg in messages[-6:]: or_messages.append({"role": msg["role"], "content": msg["content"]})
     try:
-        response = requests.post(
-            url="https://openrouter.ai/api/v1/chat/completions",
+        response = requests.post("https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"},
-            json={"model": OPENROUTER_TEXT_MODEL, "messages": or_messages, "max_tokens": 3000},
-            timeout=30
-        )
+            json={"model": OPENROUTER_TEXT_MODEL, "messages": or_messages, "max_tokens": 3000}, timeout=30)
         data = response.json()
-        if "error" in data:
-            return f"⚠️ OpenRouter: {data['error'].get('message')}"
+        if "error" in data: return f"⚠️ OpenRouter: {data['error'].get('message')}"
         return data["choices"][0]["message"]["content"]
-    except Exception as e:
-        return f"⚠️ Сбой: {e}"
+    except Exception as e: return f"⚠️ Сбой: {e}"
 
 def ask_openrouter_vision(image_b64: str, user_text: str, history: list) -> str:
-    if not OPENROUTER_KEY:
-        return "⚠️ Для фото нужен OPENROUTER_API_KEY."
-
+    if not OPENROUTER_KEY: return "⚠️ Нужен OPENROUTER_API_KEY."
     messages = []
-    for msg in history[-4:]: 
-        messages.append({"role": msg["role"], "content": msg["content"]})
-        
-    messages.append({
-        "role": "user",
-        "content": [
-            {"type": "text", "text": user_text or "Что на фото?"},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
-        ]
-    })
-
+    for msg in history[-4:]: messages.append({"role": msg["role"], "content": msg["content"]})
+    messages.append({"role": "user", "content": [
+        {"type": "text", "text": user_text or "Что на фото?"},
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
+    ]})
     try:
-        response = requests.post(
-            url="https://openrouter.ai/api/v1/chat/completions",
+        response = requests.post("https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"},
-            json={"model": OPENROUTER_VISION_MODEL, "messages": messages, "max_tokens": 3000},
-            timeout=60
-        )
+            json={"model": OPENROUTER_VISION_MODEL, "messages": messages, "max_tokens": 3000}, timeout=60)
         data = response.json()
-        if "error" in data:
-            return f"⚠️ Ошибка Vision: {data['error'].get('message')}"
+        if "error" in data: return f"⚠️ Ошибка Vision: {data['error'].get('message')}"
         return data["choices"][0]["message"]["content"]
-    except Exception as e:
-        return f"⚠️ Сбой: {str(e)}"
+    except Exception as e: return f"⚠️ Сбой: {str(e)}"
 
 def ask_text_smart(messages: list) -> str:
     contents = []
@@ -196,65 +181,45 @@ def ask_text_smart(messages: list) -> str:
         "Если пишешь код, используй ```язык\nкод\n```."
     )
     contents.append({"role": "user", "parts": [{"text": system_instruction}]})
-    
     for msg in messages:
         role = "user" if msg["role"] == "user" else "model"
         contents.append({"role": role, "parts": [{"text": msg["content"]}]})
-
     url = f"{GEMINI_PROXY}/v1beta/models/{GEMINI_TEXT_MODEL}:generateContent?key={GEMINI_KEY}"
-    
     try:
         response = requests.post(url=url, headers={"Content-Type": "application/json"}, 
             json={"contents": contents, "generationConfig": {"maxOutputTokens": 3000}}, timeout=25)
         data = response.json()
-        
         if "error" not in data and "candidates" in data:
             return data["candidates"][0]["content"]["parts"][0]["text"]
-            
-        if data.get("error", {}).get("code") == 503:
-            return ask_openrouter_text(messages)
-            
+        if data.get("error", {}).get("code") == 503: return ask_openrouter_text(messages)
         return f"⚠️ Ошибка Gemini: {data.get('error', {}).get('message')}"
-        
-    except Exception as e:
-        return ask_openrouter_text(messages)
+    except Exception: return ask_openrouter_text(messages)
 
 # --- ОТПРАВКА ---
 async def send_safe_message(update: Update, text: str):
-    # 1. Проверяем, есть ли таблица
-    csv_content = markdown_to_csv(text)
-    if csv_content:
-        # Отправляем красивую таблицу в CSV
-        file_stream = io.BytesIO(csv_content.encode('utf-8'))
-        file_stream.name = "MogAI_Table.csv"
-        await update.message.reply_document(
-            document=file_stream, 
-            caption="📊 Вот твоя таблица! Открой файл в Excel или Google Таблицах."
-        )
-        # Если после таблицы есть еще текст, отправим его тоже
-        text_without_table = re.sub(r'(\|.*\|)', '', text)
-        text_without_table = text_without_table.strip()
-        if text_without_table:
-            text = text_without_table
-        else:
-            return
+    # 1. Рисуем таблицу в PNG
+    png_buffer = markdown_to_png(text)
+    if png_buffer:
+        await update.message.reply_photo(photo=png_buffer, caption="📊 Вот твоя таблица!")
+        # Убираем таблицу из текста, чтобы не дублировать
+        text = re.sub(r'(\|.*\|)', '', text)
+        text = text.strip()
+        if not text: return # Если после таблицы ничего нет, выходим
 
-    # 2. Если очень длинный
+    # 2. Длинный текст в файл
     if len(text) > 3500:
         file_stream = io.BytesIO(text.encode('utf-8'))
         file_stream.name = "MogAI_Otvet.txt"
         await update.message.reply_document(document=file_stream, caption="📄 Длинный ответ в файле.")
         return
 
-    # 3. Форматируем и отправляем
+    # 3. Отправляем текст с кодом
     formatted_text = format_text_for_telegram(text)
-    if not formatted_text.strip():
-        return # Если после чистки ничего не осталось
+    if not formatted_text.strip(): return
 
     try:
         await update.message.reply_text(formatted_text, parse_mode="HTML")
-    except Exception as e:
-        logger.warning(f"HTML сломался: {e}. Отправляем как текст.")
+    except Exception:
         await update.message.reply_text(text)
 
 # --- КОМАНДЫ И КНОПКИ ---
@@ -264,7 +229,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 <b>Привет! Я MogAI.</b>\n\n"
         "Я умею:\n"
         "💬 Отвечать на вопросы\n"
-        "📊 <b>Создавать таблицы</b> (отправлю файлом CSV)\n"
+        "📊 <b>Создавать таблицы</b> (нарисую их как PNG-фото)\n"
         "📄 <b>Создавать .txt файлы</b>\n"
         "🧮 <b>Решать задачи по фото</b>\n\n"
         "<b>Задай вопрос!</b>"
@@ -288,7 +253,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["history"] = []
         await query.edit_message_text("🧹 Новый чат!", reply_markup=get_main_keyboard())
     elif query.data == "help":
-        text = "🤖 <b>Команды:</b>\n• /reset — сброс\n• «сделай таблицу»\n• Пришли фото задачи."
+        text = "🤖 <b>Команды:</b>\n• /reset — сброс\n• «сделай таблицу» (пришлю PNG)\n• Пришли фото задачи."
         await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
