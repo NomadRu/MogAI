@@ -21,11 +21,9 @@ if not TOKEN or not GEMINI_KEY:
     raise ValueError("Не заданы TELEGRAM_TOKEN или GEMINI_API_KEY!")
 
 GEMINI_TEXT_MODEL = "gemini-3.1-flash-lite"
-OPENROUTER_VISION_MODEL = "qwen/qwen-2-vl-72b-instruct:free"
-
-# --- ПРОКСИ ДЛЯ GEMINI ---
-# Если публичный прокси не работает, замените его на свой из Cloudflare
 GEMINI_PROXY = "https://gemini-proxy.bold-violet-3c8d.workers.dev"
+OPENROUTER_VISION_MODEL = "qwen/qwen-2-vl-72b-instruct:free"
+OPENROUTER_TEXT_MODEL = "qwen/qwen-2.5-7b-instruct:free"
 
 # --- КЛАВИАТУРЫ ---
 def get_main_keyboard():
@@ -43,44 +41,29 @@ def get_reset_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# --- ЗАПРОСЫ К GEMINI (ЧЕРЕЗ ПРОКСИ) ---
-def ask_gemini_text(messages: list) -> str:
-    contents = []
-    system_instruction = "Ты — MogAI. Отвечай кратко. Используй HTML-теги (<b>жирный</b>)."
-    contents.append({"role": "user", "parts": [{"text": system_instruction}]})
+# --- ЗАПРОСЫ К OPENROUTER (И ДЛЯ ТЕКСТА, И ДЛЯ ФОТО) ---
+def ask_openrouter_text(messages: list) -> str:
+    if not OPENROUTER_KEY:
+        return "⚠️ Для резервной модели нужен OPENROUTER_API_KEY."
     
-    for msg in messages:
-        role = "user" if msg["role"] == "user" else "model"
-        contents.append({"role": role, "parts": [{"text": msg["content"]}]})
-
-    # Используем прокси вместо прямого адреса Google
-    url = f"{GEMINI_PROXY}/v1beta/models/{GEMINI_TEXT_MODEL}:generateContent?key={GEMINI_KEY}"
+    or_messages = [{"role": "system", "content": "Ты — MogAI. Отвечай кратко. Используй HTML-теги (<b>жирный</b>)."}]
+    for msg in messages[-6:]:
+        or_messages.append({"role": msg["role"], "content": msg["content"]})
     
     try:
         response = requests.post(
-            url=url, 
-            headers={"Content-Type": "application/json"}, 
-            json={
-                "contents": contents,
-                "generationConfig": {"maxOutputTokens": 600}
-            }, 
-            timeout=40 # Даем больше времени, так как идем через прокси
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"},
+            json={"model": OPENROUTER_TEXT_MODEL, "messages": or_messages, "max_tokens": 600},
+            timeout=30
         )
         data = response.json()
-        
         if "error" in data:
-            return f"⚠️ Ошибка Gemini: {data['error'].get('message')}"
-        if "candidates" in data:
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-            
-    except requests.exceptions.Timeout:
-        return "⚠️ Прокси не ответил вовремя. Попробуйте еще раз."
+            return f"⚠️ OpenRouter (текст): {data['error'].get('message')}"
+        return data["choices"][0]["message"]["content"]
     except Exception as e:
-        return f"⚠️ Ошибка сети: {e}"
-        
-    return "⚠️ Не удалось получить ответ от ИИ."
+        return f"⚠️ Сбой резервной модели: {e}"
 
-# --- ЗАПРОСЫ К OPENROUTER (ФОТО) ---
 def ask_openrouter_vision(image_b64: str, user_text: str, history: list) -> str:
     if not OPENROUTER_KEY:
         return "⚠️ Для чтения фото нужен OPENROUTER_API_KEY."
@@ -106,10 +89,41 @@ def ask_openrouter_vision(image_b64: str, user_text: str, history: list) -> str:
         )
         data = response.json()
         if "error" in data:
-            return f"⚠️ Ошибка Vision: {data['error'].get('message')}"
+            return f"⚠️ OpenRouter (фото): {data['error'].get('message')}"
         return data["choices"][0]["message"]["content"]
     except Exception as e:
-        return f"⚠️ Сбой сети: {str(e)}"
+        return f"⚠️ Сбой Vision: {str(e)}"
+
+# --- УМНЫЙ ЗАПРОС ДЛЯ ТЕКСТА (GEMINI -> OPENROUTER) ---
+def ask_text_smart(messages: list) -> str:
+    # 1. Пробуем Gemini
+    contents = []
+    system_instruction = "Ты — MogAI. Отвечай кратко. Используй HTML-теги (<b>жирный</b>)."
+    contents.append({"role": "user", "parts": [{"text": system_instruction}]})
+    
+    for msg in messages:
+        role = "user" if msg["role"] == "user" else "model"
+        contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+
+    url = f"{GEMINI_PROXY}/v1beta/models/{GEMINI_TEXT_MODEL}:generateContent?key={GEMINI_KEY}"
+    
+    try:
+        response = requests.post(url=url, headers={"Content-Type": "application/json"}, 
+            json={"contents": contents, "generationConfig": {"maxOutputTokens": 600}}, timeout=25)
+        data = response.json()
+        
+        if "error" not in data and "candidates" in data:
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+            
+        if data.get("error", {}).get("code") == 503:
+            logger.warning("Gemini перегружен (503). Переключаемся на OpenRouter.")
+            return ask_openrouter_text(messages)
+            
+        return f"⚠️ Ошибка Gemini: {data.get('error', {}).get('message')}"
+        
+    except Exception as e:
+        logger.warning(f"Сбой Gemini: {e}. Переключаемся на OpenRouter.")
+        return ask_openrouter_text(messages)
 
 # --- ОТПРАВКА ---
 async def send_safe_message(update: Update, text: str):
@@ -186,7 +200,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history.append({"role": "user", "content": user_text})
     if len(history) > 8: history = history[-8:]
     
-    ai_response = ask_gemini_text(history)
+    # Используем умный запрос
+    ai_response = ask_text_smart(history)
     
     history.append({"role": "assistant", "content": ai_response})
     context.user_data["history"] = history
