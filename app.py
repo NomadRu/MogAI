@@ -27,8 +27,6 @@ if not TOKEN or not GEMINI_KEY:
 
 GEMINI_TEXT_MODEL = "gemini-3.1-flash-lite"
 GEMINI_PROXY = "https://gemini-proxy.bold-violet-3c8d.workers.dev"
-
-# Обновленный список Vision-моделей
 OPENROUTER_VISION_MODELS = [
     "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
     "google/gemma-4-31b-it:free",
@@ -50,6 +48,12 @@ def get_reset_keyboard():
     keyboard = [
         [InlineKeyboardButton("✅ Да, начать заново", callback_data="reset_yes")],
         [InlineKeyboardButton("❌ Нет, отмена", callback_data="reset_no")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_stop_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("⏹ Остановить", callback_data="stop_thinking")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -110,21 +114,45 @@ def format_text_for_telegram(text: str) -> str:
         text = text.replace(f"%%%CODE_BLOCK_{i}%%%", html_code)
     return text
 
-# --- АНИМАЦИЯ ---
+# --- АНИМАЦИЯ С КНОПКОЙ СТОП ---
 async def animate_thinking(update: Update, stop_event: asyncio.Event):
     try:
-        msg = await update.message.reply_text("⏳ <b>MogAI думает...</b>", parse_mode="HTML")
+        msg = await update.message.reply_text(
+            "⏳ <b>MogAI думает...</b>", 
+            parse_mode="HTML", 
+            reply_markup=get_stop_keyboard()
+        )
         seconds = 0
         while not stop_event.is_set():
             await asyncio.sleep(2)
             seconds += 2
-            if stop_event.is_set(): break
+            if stop_event.is_set():
+                break
             try:
-                await msg.edit_text(f"⏳ <b>MogAI думает...</b> ({seconds} сек)", parse_mode="HTML")
-            except Exception: pass
-        try: await msg.delete()
-        except Exception: pass
-    except Exception: pass
+                await msg.edit_text(
+                    f"⏳ <b>MogAI думает...</b> ({seconds} сек)", 
+                    parse_mode="HTML",
+                    reply_markup=get_stop_keyboard()
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+# --- ОБРАБОТЧИК КНОПКИ СТОП ---
+async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Отменяю...")
+    
+    # Устанавливаем флаг отмены для текущего пользователя
+    if "stop_event" in context.user_data:
+        context.user_data["stop_event"].set()
+    
+    # Меняем сообщение
+    try:
+        await query.edit_message_text("⏹ <b>Запрос отменён пользователем.</b>", parse_mode="HTML")
+    except Exception:
+        pass
 
 # --- ЗАПРОСЫ ---
 def ask_openrouter_text(messages: list) -> str:
@@ -142,34 +170,26 @@ def ask_openrouter_text(messages: list) -> str:
 
 def ask_openrouter_vision(image_b64: str, user_text: str, history: list) -> str:
     if not OPENROUTER_KEY: return "⚠️ Нужен OPENROUTER_API_KEY."
-    
     messages = []
     for msg in history[-4:]: messages.append({"role": msg["role"], "content": msg["content"]})
     messages.append({"role": "user", "content": [
         {"type": "text", "text": user_text or "Что на фото?"},
         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
     ]})
-    
     last_error = "Все модели недоступны"
     for model in OPENROUTER_VISION_MODELS:
         try:
             response = requests.post("https://openrouter.ai/api/v1/chat/completions",
                 headers={"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"},
-                json={"model": model, "messages": messages, "max_tokens": 3000}, timeout=60)
+                json={"model": model, "messages": messages, "max_tokens": 3000}, timeout=30)
             data = response.json()
-            
             if "error" in data:
-                err_msg = data["error"].get("message", "")
-                logger.warning(f"Модель {model} не сработала: {err_msg}")
-                last_error = err_msg
-                continue  # Пробуем следующую
-            
+                last_error = data["error"].get("message", "")
+                continue
             return data["choices"][0]["message"]["content"]
         except Exception as e:
-            logger.error(f"Сбой на {model}: {e}")
             last_error = str(e)
             continue
-    
     return f"⚠️ Не удалось обработать фото. Последняя ошибка: {last_error}"
 
 def ask_text_smart(messages: list) -> str:
@@ -185,7 +205,7 @@ def ask_text_smart(messages: list) -> str:
     url = f"{GEMINI_PROXY}/v1beta/models/{GEMINI_TEXT_MODEL}:generateContent?key={GEMINI_KEY}"
     try:
         response = requests.post(url=url, headers={"Content-Type": "application/json"}, 
-            json={"contents": contents, "generationConfig": {"maxOutputTokens": 3000}}, timeout=25)
+            json={"contents": contents, "generationConfig": {"maxOutputTokens": 3000}}, timeout=20)
         data = response.json()
         if "error" not in data and "candidates" in data:
             return data["candidates"][0]["content"]["parts"][0]["text"]
@@ -231,6 +251,10 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if query.data == "stop_thinking":
+        await stop_callback(update, context)
+        return
+    
     await query.answer()
     if query.data == "reset_confirm":
         await query.edit_message_text("⚠️ Вы уверены?", reply_markup=get_reset_keyboard(), parse_mode="HTML")
@@ -255,23 +279,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_stream.name = "MogAI_File.txt"
         await update.message.reply_document(document=file_stream, caption="📄 Файл готов!")
         return
+
+    # Создаём флаг отмены для этого запроса
     stop_event = asyncio.Event()
+    context.user_data["stop_event"] = stop_event
     animation_task = asyncio.create_task(animate_thinking(update, stop_event))
+
     try:
         history = context.user_data.get("history", [])
         history.append({"role": "user", "content": user_text})
         if len(history) > 8: history = history[-8:]
+        
+        # Запускаем запрос в отдельном потоке, чтобы не блокировать бота
         ai_response = await asyncio.to_thread(ask_text_smart, history)
+        
+        # Если пользователь нажал Стоп, пока ждали ответ — не отправляем его
+        if stop_event.is_set():
+            return
+        
         history.append({"role": "assistant", "content": ai_response})
         context.user_data["history"] = history
     finally:
         stop_event.set()
         await animation_task
+
     await send_safe_message(update, ai_response)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stop_event = asyncio.Event()
+    context.user_data["stop_event"] = stop_event
     animation_task = asyncio.create_task(animate_thinking(update, stop_event))
+
     try:
         photo_file = await update.message.photo[-1].get_file()
         file_bytes = await photo_file.download_as_bytearray()
@@ -280,16 +318,23 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await animation_task
             await update.message.reply_text("⚠️ Фото больше 4 МБ.")
             return
+
         image_b64 = base64.b64encode(file_bytes).decode("utf-8")
         caption = update.message.caption or "Что на фото?"
         history = context.user_data.get("history", [])
+        
         ai_response = await asyncio.to_thread(ask_openrouter_vision, image_b64, caption, history)
+        
+        if stop_event.is_set():
+            return
+            
         history.append({"role": "user", "content": f"[Фото] {caption}"})
         history.append({"role": "assistant", "content": ai_response})
         context.user_data["history"] = history[-8:]
     finally:
         stop_event.set()
         await animation_task
+
     await send_safe_message(update, ai_response)
 
 if __name__ == "__main__":
