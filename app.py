@@ -12,6 +12,7 @@ from telegram.ext import (
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- НАСТРОЙКИ ---
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 URL = os.environ.get("RENDER_EXTERNAL_URL")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
@@ -22,8 +23,11 @@ if not TOKEN or not GEMINI_KEY:
 
 GEMINI_TEXT_MODEL = "gemini-3.1-flash-lite"
 GEMINI_PROXY = "https://gemini-proxy.bold-violet-3c8d.workers.dev"
+
+# Модели OpenRouter
 OPENROUTER_VISION_MODEL = "qwen/qwen-2-vl-72b-instruct:free"
-OPENROUTER_TEXT_MODEL = "qwen/qwen-2.5-7b-instruct:free"
+# Автоматический роутер: сам выбирает доступную бесплатную модель для текста
+OPENROUTER_TEXT_MODEL = "openrouter/free"
 
 # --- КЛАВИАТУРЫ ---
 def get_main_keyboard():
@@ -41,7 +45,7 @@ def get_reset_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# --- ЗАПРОСЫ К OPENROUTER (И ДЛЯ ТЕКСТА, И ДЛЯ ФОТО) ---
+# --- ЗАПРОСЫ К OPENROUTER ---
 def ask_openrouter_text(messages: list) -> str:
     if not OPENROUTER_KEY:
         return "⚠️ Для резервной модели нужен OPENROUTER_API_KEY."
@@ -200,7 +204,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history.append({"role": "user", "content": user_text})
     if len(history) > 8: history = history[-8:]
     
-    # Используем умный запрос
+    # Умный запрос
     ai_response = ask_text_smart(history)
     
     history.append({"role": "assistant", "content": ai_response})
@@ -251,4 +255,4 @@ if __name__ == "__main__":
         url_path=TOKEN,
         webhook_url=f"{URL}/{TOKEN}",
         drop_pending_updates=True
-                         )
+        )
