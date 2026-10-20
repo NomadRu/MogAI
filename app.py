@@ -25,13 +25,16 @@ OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
 if not TOKEN or not GEMINI_KEY:
     raise ValueError("Не заданы TELEGRAM_TOKEN или GEMINI_API_KEY!")
 
-GEMINI_TEXT_MODEL = "gemini-3.1-flash-lite"
+# Текстовые модели Gemini (от быстрой к мощной)
+GEMINI_TEXT_MODELS = ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
+# Модели Gemini для фото (flash умеет видеть картинки)
+GEMINI_VISION_MODELS = ["gemini-3.5-flash", "gemini-3.8-flash"]
 GEMINI_PROXY = "https://gemini-proxy.bold-violet-3c8d.workers.dev"
+
+# Резервные модели OpenRouter (на случай, если Gemini совсем упадет)
 OPENROUTER_VISION_MODELS = [
     "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
-    "google/gemma-4-31b-it:free",
-    "nvidia/nemotron-nano-12b-v2-vl:free",
-    "google/gemma-4-26b-a4b-it:free"
+    "google/gemma-4-31b-it:free"
 ]
 OPENROUTER_TEXT_MODEL = "openrouter/free"
 
@@ -52,10 +55,7 @@ def get_reset_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def get_stop_keyboard():
-    keyboard = [
-        [InlineKeyboardButton("⏹ Остановить", callback_data="stop_thinking")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Остановить", callback_data="stop_thinking")]])
 
 # --- РИСОВАНИЕ ТАБЛИЦЫ В PNG ---
 def markdown_to_png(text: str) -> io.BytesIO:
@@ -89,7 +89,7 @@ def markdown_to_png(text: str) -> io.BytesIO:
     plt.close(fig)
     return buf
 
-# --- ЧИСТИЛЬЩИК ТЕКСТА И КОДА ---
+# --- ЧИСТИЛЬЩИК ТЕКСТА ---
 def format_text_for_telegram(text: str) -> str:
     code_blocks = []
     def save_code_block(match):
@@ -114,50 +114,83 @@ def format_text_for_telegram(text: str) -> str:
         text = text.replace(f"%%%CODE_BLOCK_{i}%%%", html_code)
     return text
 
-# --- АНИМАЦИЯ С КНОПКОЙ СТОП ---
+# --- АНИМАЦИЯ ---
 async def animate_thinking(update: Update, stop_event: asyncio.Event):
     try:
-        msg = await update.message.reply_text(
-            "⏳ <b>MogAI думает...</b>", 
-            parse_mode="HTML", 
-            reply_markup=get_stop_keyboard()
-        )
+        msg = await update.message.reply_text("⏳ <b>MogAI думает...</b>", parse_mode="HTML", reply_markup=get_stop_keyboard())
         seconds = 0
         while not stop_event.is_set():
             await asyncio.sleep(2)
             seconds += 2
-            if stop_event.is_set():
-                break
+            if stop_event.is_set(): break
             try:
-                await msg.edit_text(
-                    f"⏳ <b>MogAI думает...</b> ({seconds} сек)", 
-                    parse_mode="HTML",
-                    reply_markup=get_stop_keyboard()
-                )
-            except Exception:
-                pass
-    except Exception:
-        pass
+                await msg.edit_text(f"⏳ <b>MogAI думает...</b> ({seconds} сек)", parse_mode="HTML", reply_markup=get_stop_keyboard())
+            except Exception: pass
+    except Exception: pass
 
-# --- ОБРАБОТЧИК КНОПКИ СТОП ---
 async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("Отменяю...")
-    
-    # Устанавливаем флаг отмены для текущего пользователя
     if "stop_event" in context.user_data:
         context.user_data["stop_event"].set()
-    
-    # Меняем сообщение
     try:
-        await query.edit_message_text("⏹ <b>Запрос отменён пользователем.</b>", parse_mode="HTML")
-    except Exception:
-        pass
+        await query.edit_message_text("⏹ <b>Запрос отменён.</b>", parse_mode="HTML")
+    except Exception: pass
 
-# --- ЗАПРОСЫ ---
+# --- ЗАПРОСЫ К GEMINI ---
+def ask_gemini_text(messages: list) -> str:
+    contents = []
+    system_instruction = "Ты — MogAI. Используй Markdown для таблиц (| и -) и ``` для кода."
+    contents.append({"role": "user", "parts": [{"text": system_instruction}]})
+    for msg in messages:
+        role = "user" if msg["role"] == "user" else "model"
+        contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+
+    for model in GEMINI_TEXT_MODELS:
+        url = f"{GEMINI_PROXY}/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+        try:
+            response = requests.post(url=url, headers={"Content-Type": "application/json"}, 
+                json={"contents": contents, "generationConfig": {"maxOutputTokens": 3000}}, timeout=20)
+            data = response.json()
+            if "error" not in data and "candidates" in data:
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            if data.get("error", {}).get("code") in (503, 429):
+                continue # Пробуем следующую модель
+            return f"⚠️ Ошибка Gemini: {data.get('error', {}).get('message')}"
+        except Exception:
+            continue
+    # Если Gemini не справился, идем в OpenRouter
+    return ask_openrouter_text(messages)
+
+def ask_gemini_vision(image_b64: str, user_text: str) -> str:
+    """Обработка фото через Gemini"""
+    for model in GEMINI_VISION_MODELS:
+        url = f"{GEMINI_PROXY}/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+        try:
+            response = requests.post(url=url, headers={"Content-Type": "application/json"}, 
+                json={
+                    "contents": [{
+                        "parts": [
+                            {"text": user_text or "Что на фото? Опиши или реши задачу."},
+                            {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}}
+                        ]
+                    }]
+                }, timeout=40)
+            data = response.json()
+            if "error" not in data and "candidates" in data:
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            if data.get("error", {}).get("code") in (503, 429):
+                continue # Пробуем следующую модель
+            return f"⚠️ Ошибка Gemini (фото): {data.get('error', {}).get('message')}"
+        except Exception:
+            continue
+    # Если Gemini не смог, идем в OpenRouter
+    return ask_openrouter_vision(image_b64, user_text, [])
+
+# --- РЕЗЕРВНЫЕ ЗАПРОСЫ К OPENROUTER ---
 def ask_openrouter_text(messages: list) -> str:
     if not OPENROUTER_KEY: return "⚠️ Нужен OPENROUTER_API_KEY."
-    or_messages = [{"role": "system", "content": "Ты — MogAI. Отвечай текстом."}]
+    or_messages = [{"role": "system", "content": "Ты — MogAI."}]
     for msg in messages[-6:]: or_messages.append({"role": msg["role"], "content": msg["content"]})
     try:
         response = requests.post("https://openrouter.ai/api/v1/chat/completions",
@@ -190,28 +223,7 @@ def ask_openrouter_vision(image_b64: str, user_text: str, history: list) -> str:
         except Exception as e:
             last_error = str(e)
             continue
-    return f"⚠️ Не удалось обработать фото. Последняя ошибка: {last_error}"
-
-def ask_text_smart(messages: list) -> str:
-    contents = []
-    system_instruction = (
-        "Ты — MogAI. Если нужно создать таблицу, используй Markdown (| и -).\n"
-        "Если пишешь код, используй ```язык\nкод\n```."
-    )
-    contents.append({"role": "user", "parts": [{"text": system_instruction}]})
-    for msg in messages:
-        role = "user" if msg["role"] == "user" else "model"
-        contents.append({"role": role, "parts": [{"text": msg["content"]}]})
-    url = f"{GEMINI_PROXY}/v1beta/models/{GEMINI_TEXT_MODEL}:generateContent?key={GEMINI_KEY}"
-    try:
-        response = requests.post(url=url, headers={"Content-Type": "application/json"}, 
-            json={"contents": contents, "generationConfig": {"maxOutputTokens": 3000}}, timeout=20)
-        data = response.json()
-        if "error" not in data and "candidates" in data:
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-        if data.get("error", {}).get("code") == 503: return ask_openrouter_text(messages)
-        return f"⚠️ Ошибка Gemini: {data.get('error', {}).get('message')}"
-    except Exception: return ask_openrouter_text(messages)
+    return f"⚠️ Резервные модели тоже не сработали. Ошибка: {last_error}"
 
 # --- ОТПРАВКА ---
 async def send_safe_message(update: Update, text: str):
@@ -254,7 +266,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "stop_thinking":
         await stop_callback(update, context)
         return
-    
     await query.answer()
     if query.data == "reset_confirm":
         await query.edit_message_text("⚠️ Вы уверены?", reply_markup=get_reset_keyboard(), parse_mode="HTML")
@@ -280,7 +291,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(document=file_stream, caption="📄 Файл готов!")
         return
 
-    # Создаём флаг отмены для этого запроса
     stop_event = asyncio.Event()
     context.user_data["stop_event"] = stop_event
     animation_task = asyncio.create_task(animate_thinking(update, stop_event))
@@ -289,20 +299,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         history = context.user_data.get("history", [])
         history.append({"role": "user", "content": user_text})
         if len(history) > 8: history = history[-8:]
-        
-        # Запускаем запрос в отдельном потоке, чтобы не блокировать бота
-        ai_response = await asyncio.to_thread(ask_text_smart, history)
-        
-        # Если пользователь нажал Стоп, пока ждали ответ — не отправляем его
-        if stop_event.is_set():
-            return
-        
+        ai_response = await asyncio.to_thread(ask_gemini_text, history)
+        if stop_event.is_set(): return
         history.append({"role": "assistant", "content": ai_response})
         context.user_data["history"] = history
     finally:
         stop_event.set()
         await animation_task
-
     await send_safe_message(update, ai_response)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -320,13 +323,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         image_b64 = base64.b64encode(file_bytes).decode("utf-8")
-        caption = update.message.caption or "Что на фото?"
+        caption = update.message.caption or "Что на фото? Реши задачу."
         history = context.user_data.get("history", [])
         
-        ai_response = await asyncio.to_thread(ask_openrouter_vision, image_b64, caption, history)
-        
-        if stop_event.is_set():
-            return
+        # Идем в Gemini (Vision)
+        ai_response = await asyncio.to_thread(ask_gemini_vision, image_b64, caption)
+        if stop_event.is_set(): return
             
         history.append({"role": "user", "content": f"[Фото] {caption}"})
         history.append({"role": "assistant", "content": ai_response})
@@ -334,7 +336,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         stop_event.set()
         await animation_task
-
     await send_safe_message(update, ai_response)
 
 if __name__ == "__main__":
