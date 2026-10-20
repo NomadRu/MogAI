@@ -35,19 +35,16 @@ GROQ_KEY = os.environ.get("GROQ_API_KEY")
 if not TOKEN or not GROQ_KEY:
     raise ValueError("Не заданы TELEGRAM_TOKEN или GROQ_API_KEY!")
 
-# --- АКТУАЛЬНЫЕ МОДЕЛИ GROQ (ИЗ ВАШЕГО СКРИНШОТА) ---
 GROQ_TEXT_MODELS = [
-    "llama-3.1-8b-instant",            # Самая быстрая
-    "llama-3.3-70b-versatile",         # Умная
-    "meta-llama/llama-3.3-70b-versatile", # С префиксом (на всякий случай)
-    "openai/gpt-oss-20b"               # Резервная
+    "llama-3.1-8b-instant",
+    "llama-3.3-70b-versatile",
+    "meta-llama/llama-3.3-70b-versatile",
+    "openai/gpt-oss-20b"
 ]
-
 GROQ_VISION_MODELS = [
-    "openai/gpt-oss-120b",             # Отлично видит картинки (из вашего списка)
-    "openai/gpt-oss-20b"               # Запасная
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b"
 ]
-
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # --- КЛАВИАТУРЫ ---
@@ -67,7 +64,7 @@ def get_reset_keyboard():
 def get_stop_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Остановить", callback_data="stop_thinking")]])
 
-# --- ПАРСЕР ТАБЛИЦ В PNG ---
+# --- ПАРСЕР ТАБЛИЦ (РИСУЕТ ТОЛЬКО КОРОТКИЕ) ---
 def markdown_to_png(text: str) -> io.BytesIO:
     if not HAS_MATPLOTLIB: return None
     try:
@@ -80,17 +77,25 @@ def markdown_to_png(text: str) -> io.BytesIO:
                 if all(re.match(r'^:?-+:?$', p) for p in parts if p): continue
                 if any(p for p in parts): table_data.append(parts)
         if len(table_data) < 2: return None
+        for row in table_data:
+            for cell in row:
+                if len(cell) > 40: return None
+
         max_cols = max(len(row) for row in table_data)
         for row in table_data:
             while len(row) < max_cols: row.append("")
-        fig, ax = plt.subplots(figsize=(10, max(2, len(table_data) * 0.5)))
+            
+        fig, ax = plt.subplots(figsize=(10, max(2, len(table_data) * 0.6)))
         ax.axis('tight'); ax.axis('off')
         table = ax.table(cellText=table_data[1:], colLabels=table_data[0], cellLoc='center', loc='center')
-        table.auto_set_font_size(False); table.set_fontsize(10); table.scale(1.2, 1.5)
+        table.auto_set_font_size(False); table.set_fontsize(9); table.scale(1.2, 1.8)
+        
         for (row, col), cell in table.get_celld().items():
             if row == 0:
                 cell.set_text_props(weight='bold', color='white'); cell.set_facecolor('#4a4a4a')
-            else: cell.set_facecolor('#f0f0f0' if row % 2 == 0 else 'white')
+            else: 
+                cell.set_facecolor('#f0f0f0' if row % 2 == 0 else 'white')
+                
         buf = io.BytesIO()
         plt.savefig(buf, format='png', bbox_inches='tight', dpi=200)
         buf.seek(0); plt.close(fig)
@@ -143,7 +148,7 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- ЗАПРОСЫ К GROQ ---
 def ask_groq_text(messages: list) -> str:
-    or_messages = [{"role": "system", "content": "Ты — MogAI. Отвечай текстом. Используй таблицы (Markdown), если попросят."}]
+    or_messages = [{"role": "system", "content": "Ты — MogAI. Отвечай текстом. Если просят таблицу, используй Markdown (| и -)."}]
     for msg in messages[-8:]:
         or_messages.append({"role": msg["role"], "content": msg["content"]})
 
@@ -157,29 +162,29 @@ def ask_groq_text(messages: list) -> str:
                 timeout=40
             )
             data = response.json()
-            
             if "error" not in data and "choices" in data:
                 return data["choices"][0]["message"]["content"]
-            
-            err_msg = data.get("error", {}).get("message", "")
-            last_error = err_msg
-            logger.warning(f"Модель {model} не сработала: {err_msg}")
-            
+            last_error = data.get("error", {}).get("message", "")
         except Exception as e:
             last_error = str(e)
             continue
-
     return f"⚠️ Ошибка Groq: {last_error}"
 
 def ask_groq_vision(image_b64: str, user_text: str, history: list) -> str:
-    messages = []
-    for msg in history[-4:]:
-        messages.append({"role": msg["role"], "content": msg["content"]})
-        
+    # Формируем историю для Groq (только текст, без картинок)
+    messages = [{"role": "system", "content": "Ты — MogAI. Отвечай текстом."}]
+    for msg in history[-6:]:
+        # Если это было фото — заменяем на текст
+        if isinstance(msg["content"], list):
+            messages.append({"role": msg["role"], "content": "[Пользователь отправил фото]"})
+        else:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+            
+    # Добавляем текущее фото
     messages.append({
         "role": "user",
         "content": [
-            {"type": "text", "text": user_text or "Что на фото?"},
+            {"type": "text", "text": user_text or "Что на фото? Реши задачу."},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
         ]
     })
@@ -194,18 +199,12 @@ def ask_groq_vision(image_b64: str, user_text: str, history: list) -> str:
                 timeout=60
             )
             data = response.json()
-            
             if "error" not in data and "choices" in data:
                 return data["choices"][0]["message"]["content"]
-                
-            err_msg = data.get("error", {}).get("message", "")
-            last_error = err_msg
-            logger.warning(f"Vision-модель {model} не сработала: {err_msg}")
-
+            last_error = data.get("error", {}).get("message", "")
         except Exception as e:
             last_error = str(e)
             continue
-            
     return f"⚠️ Ошибка Groq (фото): {last_error}"
 
 # --- СОЗДАНИЕ РЕФЕРАТА ---
@@ -215,9 +214,7 @@ def create_gost_document(topic: str) -> io.BytesIO:
         "Структура: Введение, Основная часть, Заключение. Объем: 1000-1500 слов. "
         "Пиши чистым текстом без Markdown. Заголовки пиши ЗАГЛАВНЫМИ буквами."
     )
-    
     raw_text = ask_groq_text([{"role": "user", "content": prompt}])
-    
     if not raw_text or "⚠️" in raw_text: return None
 
     raw_text = re.sub(r'[*#_`~]', '', raw_text)
@@ -230,10 +227,8 @@ def create_gost_document(topic: str) -> io.BytesIO:
         style.font.size = Pt(14)
         
         for section in doc.sections:
-            section.left_margin = Cm(3)
-            section.right_margin = Cm(1.5)
-            section.top_margin = Cm(2)
-            section.bottom_margin = Cm(2)
+            section.left_margin = Cm(3); section.right_margin = Cm(1.5)
+            section.top_margin = Cm(2); section.bottom_margin = Cm(2)
             
         def add_gost_paragraph(text, is_heading=False):
             p = doc.add_paragraph()
@@ -243,8 +238,7 @@ def create_gost_document(topic: str) -> io.BytesIO:
             if is_heading:
                 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 p.paragraph_format.first_line_indent = Cm(0)
-                run = p.add_run(text.upper())
-                run.bold = True
+                run = p.add_run(text.upper()); run.bold = True
             else:
                 p.add_run(text)
 
@@ -261,12 +255,9 @@ def create_gost_document(topic: str) -> io.BytesIO:
             else:
                 add_gost_paragraph(line)
                 
-        buf = io.BytesIO()
-        doc.save(buf); buf.seek(0)
+        buf = io.BytesIO(); doc.save(buf); buf.seek(0)
         return buf
-    except Exception as e:
-        logger.error(f"Ошибка сборки DOCX: {e}")
-        return None
+    except Exception: return None
 
 # --- ОТПРАВКА ---
 async def send_safe_message(update: Update, text: str):
@@ -295,7 +286,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 <b>Привет! Я MogAI (на базе Groq).</b>\n\n"
         "Я умею:\n"
         "💬 Отвечать на вопросы\n"
-        "📊 <b>Создавать таблицы</b> (PNG)\n"
+        "📊 <b>Создавать таблицы</b>\n"
         "📝 <b>Писать рефераты по ГОСТу</b> (.docx)\n"
         "🧮 <b>Решать задачи по фото</b>\n\n"
         "Напиши: <i>«напиши реферат на тему [тема]»</i>"
@@ -344,7 +335,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         caption=f"📝 Реферат по ГОСТу: <b>{topic}</b>", parse_mode="HTML"
                     )
                 else: 
-                    await update.message.reply_text("⚠️ Не удалось создать реферат (ошибка Groq).")
+                    await update.message.reply_text("⚠️ Не удалось создать реферат.")
             finally:
                 stop_event.set(); await anim
             return
@@ -380,8 +371,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 stop_event.set(); await anim; await update.message.reply_text("⚠️ Фото больше 4 МБ."); return
             image_b64 = base64.b64encode(file_bytes).decode("utf-8")
             caption = update.message.caption or "Что на фото?"
+            
             history = context.user_data.get("history", [])
             
+            # Передаем историю (с заменой фото на текст) + текущее фото
             ai_response = await asyncio.to_thread(ask_groq_vision, image_b64, caption, history)
             
             if stop_event.is_set(): return
