@@ -6,7 +6,7 @@ import io
 import asyncio
 import re
 import matplotlib
-matplotlib.use('Agg') # Важно для работы на сервере без экрана
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -27,7 +27,7 @@ if not TOKEN or not GEMINI_KEY:
 
 GEMINI_TEXT_MODEL = "gemini-3.1-flash-lite"
 GEMINI_PROXY = "https://gemini-proxy.bold-violet-3c8d.workers.dev"
-OPENROUTER_VISION_MODEL = "qwen/qwen2.5-vl-3b-instruct:free"
+OPENROUTER_VISION_MODEL = "google/gemma-4-26b-a4b-it:free"
 OPENROUTER_TEXT_MODEL = "openrouter/free"
 
 # --- КЛАВИАТУРЫ ---
@@ -55,7 +55,6 @@ def markdown_to_png(text: str) -> io.BytesIO:
         clean_line = line.strip()
         if "|" in clean_line and not clean_line.startswith('```'):
             parts = [part.strip() for part in clean_line.strip('|').split('|')]
-            # Пропускаем разделители
             if all(re.match(r'^:?-+:?$', p) for p in parts if p):
                 continue
             table_data.append(parts)
@@ -63,20 +62,16 @@ def markdown_to_png(text: str) -> io.BytesIO:
     if not table_data:
         return None
 
-    # Настройка графика
     fig, ax = plt.subplots(figsize=(10, max(2, len(table_data) * 0.5)))
     ax.axis('tight')
     ax.axis('off')
     
-    # Рисуем таблицу (первая строка - заголовки)
     table = ax.table(cellText=table_data[1:], colLabels=table_data[0], cellLoc='center', loc='center')
     
-    # Красивое оформление
     table.auto_set_font_size(False)
     table.set_fontsize(10)
     table.scale(1.2, 1.5)
     
-    # Делаем заголовки жирными и с фоном
     for (row, col), cell in table.get_celld().items():
         if row == 0:
             cell.set_text_props(weight='bold', color='white')
@@ -84,15 +79,14 @@ def markdown_to_png(text: str) -> io.BytesIO:
         else:
             cell.set_facecolor('#f0f0f0' if row % 2 == 0 else 'white')
 
-    # Сохраняем в буфер
     buf = io.BytesIO()
     plt.savefig(buf, format='png', bbox_inches='tight', dpi=200)
     buf.seek(0)
-    plt.close(fig) # Обязательно закрываем фигуру, чтобы не забивать память
+    plt.close(fig)
     return buf
 
 # --- ЧИСТИЛЬЩИК ТЕКСТА И КОДА ---
-def format_text_for_telegram(text: str):
+def format_text_for_telegram(text: str) -> str:
     code_blocks = []
     def save_code_block(match):
         lang = match.group(1).strip() if match.group(1) else ""
@@ -102,20 +96,16 @@ def format_text_for_telegram(text: str):
     
     text = re.sub(r'```([a-zA-Z0-9]*)\n([\s\S]*?)```', save_code_block, text)
     
-    # Убираем Markdown-таблицы
     text = re.sub(r'(\|.*\|)', '', text)
     text = re.sub(r'(-{3,}.*)', '', text)
     
-    # Жирный и курсив
     text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
     text = re.sub(r'__(.*?)__', r'<b>\1</b>', text)
     text = re.sub(r'\*(.*?)\*', r'<i>\1</i>', text)
     text = re.sub(r'_(.*?)_', r'<i>\1</i>', text)
     
-    # Заголовки
     text = re.sub(r'^#{1,6}\s+(.*)$', r'<b>\1</b>', text, flags=re.MULTILINE)
     
-    # Экранируем HTML
     text = text.replace('&', '&amp;').replace('>', '&gt;').replace('<', '&lt;')
     for tag in ['b', 'i', 's', 'code', 'pre']:
         text = text.replace(f'&lt;{tag}&gt;', f'<{tag}>').replace(f'&lt;/{tag}&gt;', f'</{tag}>')
@@ -197,23 +187,19 @@ def ask_text_smart(messages: list) -> str:
 
 # --- ОТПРАВКА ---
 async def send_safe_message(update: Update, text: str):
-    # 1. Рисуем таблицу в PNG
     png_buffer = markdown_to_png(text)
     if png_buffer:
         await update.message.reply_photo(photo=png_buffer, caption="📊 Вот твоя таблица!")
-        # Убираем таблицу из текста, чтобы не дублировать
         text = re.sub(r'(\|.*\|)', '', text)
         text = text.strip()
-        if not text: return # Если после таблицы ничего нет, выходим
+        if not text: return
 
-    # 2. Длинный текст в файл
     if len(text) > 3500:
         file_stream = io.BytesIO(text.encode('utf-8'))
         file_stream.name = "MogAI_Otvet.txt"
         await update.message.reply_document(document=file_stream, caption="📄 Длинный ответ в файле.")
         return
 
-    # 3. Отправляем текст с кодом
     formatted_text = format_text_for_telegram(text)
     if not formatted_text.strip(): return
 
