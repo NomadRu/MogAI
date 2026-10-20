@@ -20,7 +20,11 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 if not TOKEN or not GEMINI_KEY:
     raise ValueError("Не заданы TELEGRAM_TOKEN или GEMINI_API_KEY!")
 
-GEMINI_MODELS = ["gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash"]
+# Модели для ТЕКСТА (быстрые)
+GEMINI_TEXT_MODELS = ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
+
+# Модели для ФОТО (те, которые точно видят картинки и мощные)
+GEMINI_VISION_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash"]
 
 # --- КЛАВИАТУРЫ ---
 def get_main_keyboard():
@@ -38,7 +42,7 @@ def get_reset_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# --- ГЕНЕРАЦИЯ И ИЗМЕНЕНИЕ КАРТИНОК ---
+# --- ГЕНЕРАЦИЯ КАРТИНОК ---
 def generate_image(prompt: str) -> str:
     full_prompt = f"{prompt}, masterpiece, high quality, detailed"
     encoded_prompt = urllib.parse.quote(full_prompt)
@@ -52,18 +56,14 @@ def modify_image_pollinations(image_url: str, prompt: str) -> str:
 # --- ЗАПРОСЫ К GEMINI ---
 def ask_ai(messages: list) -> str:
     contents = []
-    system_instruction = (
-        "Ты — MogAI. Отвечай текстом. Используй HTML-теги для форматирования (например, <b>жирный</b>, <i>курсив</i>). "
-        "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО выводить JSON-код. Если нужно написать математическую формулу, напиши её обычным текстом, "
-        "без сложных LaTeX-конструкций с обратными слэшами, чтобы Telegram мог её отобразить."
-    )
+    system_instruction = "Ты — MogAI. Отвечай текстом. Используй HTML-теги (<b>жирный</b>). Не выводи JSON."
     contents.append({"role": "user", "parts": [{"text": system_instruction}]})
     
     for msg in messages:
         role = "user" if msg["role"] == "user" else "model"
         contents.append({"role": role, "parts": [{"text": msg["content"]}]})
 
-    for model in GEMINI_MODELS:
+    for model in GEMINI_TEXT_MODELS:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
         try:
             response = requests.post(url=url, headers={"Content-Type": "application/json"}, json={"contents": contents}, timeout=30)
@@ -75,43 +75,42 @@ def ask_ai(messages: list) -> str:
                 return data["candidates"][0]["content"]["parts"][0]["text"]
         except Exception:
             continue
-    return "⚠️ Все модели перегружены. Попробуйте позже."
+    return "⚠️ Все текстовые модели перегружены. Попробуйте позже."
 
 def ask_ai_with_image(image_b64: str, user_text: str) -> str:
-    for model in GEMINI_MODELS:
+    # Для фото перебираем ТОЛЬКО зрячие модели
+    for model in GEMINI_VISION_MODELS:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
         try:
             response = requests.post(
                 url=url, headers={"Content-Type": "application/json"},
                 json={"contents": [{"parts": [{"text": user_text}, {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}}]}]},
-                timeout=30
+                timeout=90 # Ждем до 90 секунд для сложных фото
             )
             data = response.json()
             if "error" in data:
-                if data["error"].get("code") in (503, 429): continue
-                return f"⚠️ Ошибка Gemini: {data['error'].get('message')}"
+                logger.error(f"Ошибка модели {model} на фото: {data['error']}")
+                if data["error"].get("code") in (503, 429, 500): continue
+                return f"⚠️ Ошибка Gemini (фото): {data['error'].get('message')}"
             if "candidates" in data:
                 return data["candidates"][0]["content"]["parts"][0]["text"]
-        except Exception:
+        except Exception as e:
+            logger.error(f"Сбой сети на модели {model} (фото): {e}")
             continue
-    return "⚠️ Не удалось обработать фото."
+    return "⚠️ Не удалось обработать фото. Попробуйте сфотографировать ближе или меньшим количеством задач за раз."
 
-# --- УМНАЯ ОТПРАВКА (ИСПРАВЛЕНИЕ ЗАВИСАНИЙ) ---
+# --- УМНАЯ ОТПРАВКА ---
 async def send_safe_message(update: Update, text: str):
-    """Пытается отправить HTML, если ошибка — отправляет обычный текст. Если текст длинный — создает файл."""
-    # Если текст слишком длинный (больше 4000 символов), отправляем файлом
-    if len(text) > 4000:
+    if len(text) > 3500:
         file_stream = io.BytesIO(text.encode('utf-8'))
-        file_stream.name = "MogAI_Otvet.txt"
-        await update.message.reply_document(document=file_stream, caption="📄 Ответ слишком длинный, я сохранил его в файл.")
+        file_stream.name = "Reshenie.txt"
+        await update.message.reply_document(document=file_stream, caption="📄 Ответ получился очень длинным. Я сохранил его в файл!")
         return
 
     try:
-        # Пытаемся отправить с HTML (жирный, курсив)
         await update.message.reply_text(text, parse_mode="HTML")
     except Exception as e:
         logger.warning(f"Ошибка HTML: {e}. Отправляем как обычный текст.")
-        # Если HTML сломался (например, из-за формул), отправляем чистый текст
         await update.message.reply_text(text)
 
 # --- КОМАНДЫ ---
@@ -123,7 +122,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💬 Отвечать на вопросы\n"
         "🎨 <b>Рисовать картинки</b> (напиши «нарисуй кота»)\n"
         "🖌️ <b>Изменять фото</b> (пришли фото с подписью «сделай его синим»)\n"
-        "📄 <b>Создавать .txt файлы</b> (напиши «создай файл: [текст]»)\n\n"
+        "📄 <b>Создавать .txt файлы</b>\n"
+        "🧮 <b>Решать задачи с фото</b> (если ответ длинный, пришлю файлом)\n\n"
         "<b>Задай вопрос или используй кнопки!</b>"
     )
     await update.message.reply_text(welcome_text, reply_markup=get_main_keyboard(), parse_mode="HTML")
@@ -155,8 +155,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• /reset — сброс памяти\n"
             "• <b>Генерация:</b> «нарисуй закат»\n"
             "• <b>Изменение фото:</b> пришли фото с подписью «сделай его в стиле киберпанк»\n"
-            "• <b>Создание файла:</b> «создай файл: Привет!»\n"
-            "• Если ответ содержит сложные формулы, я пришлю его текстовым файлом."
+            "• <b>Создание файла:</b> «создай файл: Привет!»"
         )
         await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
@@ -164,7 +163,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
     
-    # 1. ГЕНЕРАЦИЯ КАРТИНОК
     if "нарисуй" in user_text or "сгенерируй" in user_text:
         await update.message.chat.send_action(action="upload_photo")
         prompt = user_text.replace("нарисуй", "").replace("сгенерируй", "").strip()
@@ -173,7 +171,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_photo(photo=image_url, caption=f"🎨 Вот картинка по запросу: {prompt}")
         return
 
-    # 2. СОЗДАНИЕ TXT ФАЙЛА ВРУЧНУЮ
     if "создай файл" in user_text or "сделай файл" in user_text:
         await update.message.chat.send_action(action="upload_document")
         content = user_text.split("файл", 1)[1].replace(":", "").strip()
@@ -183,7 +180,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(document=file_stream, caption="📄 Файл готов!")
         return
 
-    # 3. ОБЫЧНЫЙ ЧАТ
     history = context.user_data.get("history", [])
     history.append({"role": "user", "content": user_text})
     if len(history) > 12: history = history[-12:]
@@ -193,7 +189,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history.append({"role": "assistant", "content": ai_response})
     context.user_data["history"] = history
     
-    # Используем безопасную отправку!
     await send_safe_message(update, ai_response)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -209,10 +204,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_url = photo_file.file_path
             if not file_url:
                 file_url = f"https://api.telegram.org/file/bot{TOKEN}/{photo_file.file_path}"
-            
             prompt = caption.lower().replace("сделай", "").replace("измени", "").strip()
             if not prompt: prompt = "cyberpunk style"
-            
             modified_url = modify_image_pollinations(file_url, prompt)
             response = requests.get(modified_url, timeout=60)
             if response.status_code == 200:
@@ -223,7 +216,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Ошибка изменения фото: {e}")
             await update.message.reply_text("⚠️ Не удалось изменить фото. Попробуйте другой запрос.")
     else:
-        if not caption: caption = "Что на фото? Опиши."
+        if not caption: caption = "Реши задачи на фото. Если ответ длинный, оформи его пошагово."
         ai_response = ask_ai_with_image(image_b64, caption)
         await send_safe_message(update, ai_response)
 
