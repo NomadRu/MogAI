@@ -183,38 +183,59 @@ def ask_gemini_vision(image_b64: str, user_text: str) -> str:
 def create_presentation(topic: str) -> io.BytesIO:
     prompt = (
         f"Создай структуру для презентации на тему: '{topic}'. "
-        "Ответь СТРОГО в формате JSON (без Markdown-тегов, только чистый JSON). "
-        "Формат: {\"title\": \"Заголовок\", \"slides\": [{\"title\": \"Название слайда\", \"content\": \"Текст слайда\"}]}. "
-        "Сделай 3-5 слайдов. Текст на слайдах должен быть кратким (1-2 предложения)."
+        "Ответь СТРОГО в формате JSON. "
+        'Формат: {"title": "Заголовок", "slides": [{"title": "Название слайда", "content": "Текст слайда"}]}. '
+        "Сделай 3-5 слайдов."
     )
     url = f"{GEMINI_PROXY}/v1beta/models/{GEMINI_TEXT_MODELS[0]}:generateContent?key={GEMINI_KEY}"
+    
+    raw_text = ""
     try:
         response = requests.post(url=url, headers={"Content-Type": "application/json"}, 
             json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 1500}}, timeout=30)
         data = response.json()
-        if "error" in data: return None
+        
+        if "error" in data:
+            logger.error(f"Google API Error: {data['error']}")
+            return None
+            
         raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+        logger.info(f"Ответ от Google для презентации: {raw_text[:200]}...")
+        
+        # Очистка от возможных ```json ... ```
         raw_text = re.sub(r'```json|```', '', raw_text).strip()
+        
+        # Вырезаем JSON из текста, если ИИ добавил что-то лишнее
+        json_match = re.search(r'\{[\s\S]*\}', raw_text)
+        if json_match:
+            raw_text = json_match.group(0)
+            
         pres_data = json.loads(raw_text)
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"Не удалось распарсить JSON: {e}. Текст: {raw_text}")
+        return None
     except Exception as e:
-        logger.error(f"Ошибка генерации JSON: {e}"); return None
+        logger.error(f"Ошибка при запросе к Google: {e}")
+        return None
 
     try:
         prs = Presentation()
         slide = prs.slides.add_slide(prs.slide_layouts[0])
-        slide.shapes.title.text = pres_data.get("title", topic)
+        slide.shapes.title.text = str(pres_data.get("title", topic))
         slide.placeholders[1].text = "Создано MogAI"
 
         for slide_info in pres_data.get("slides", []):
             slide = prs.slides.add_slide(prs.slide_layouts[1])
-            slide.shapes.title.text = slide_info.get("title", "Слайд")
-            slide.shapes.placeholders[1].text_frame.text = slide_info.get("content", "")
+            slide.shapes.title.text = str(slide_info.get("title", "Слайд"))
+            slide.shapes.placeholders[1].text_frame.text = str(slide_info.get("content", ""))
             
         buf = io.BytesIO()
         prs.save(buf); buf.seek(0)
         return buf
     except Exception as e:
-        logger.error(f"Ошибка сборки PPTX: {e}"); return None
+        logger.error(f"Ошибка при сборке PPTX: {e}")
+        return None
 
 # --- ОТПРАВКА ---
 async def send_safe_message(update: Update, text: str):
