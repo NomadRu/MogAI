@@ -28,11 +28,12 @@ if not TOKEN or not GEMINI_KEY:
 GEMINI_TEXT_MODEL = "gemini-3.1-flash-lite"
 GEMINI_PROXY = "https://gemini-proxy.bold-violet-3c8d.workers.dev"
 
-# Список Vision-моделей для перебора (от лучшей к запасной)
+# Обновленный список Vision-моделей
 OPENROUTER_VISION_MODELS = [
-    "google/gemma-4-26b-a4b-it:free",      # Основная
-    "nvidia/nemotron-nano-12b-v2-vl:free", # Запасная (хороша для документов/OCR)
-    "google/gemma-4-31b-it:free"           # Ещё одна запасная
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+    "google/gemma-4-31b-it:free",
+    "nvidia/nemotron-nano-12b-v2-vl:free",
+    "google/gemma-4-26b-a4b-it:free"
 ]
 OPENROUTER_TEXT_MODEL = "openrouter/free"
 
