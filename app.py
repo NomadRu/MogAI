@@ -36,8 +36,8 @@ if not TOKEN or not ZAI_KEY:
     raise ValueError("Не заданы TELEGRAM_TOKEN или ZAI_API_KEY!")
 
 # Модели Z.Ai. 
-ZAI_TEXT_MODEL = "glm-4-flash"  # Быстрая текстовая модель
-ZAI_VISION_MODEL = "glm-4v-flash" # Модель, которая видит картинки
+ZAI_TEXT_MODEL = "GLM-5.3-Flash"  
+ZAI_VISION_MODEL = "GLM-5.3-Flash" # Пока ставим её же, проверим, увидит ли она фото
 ZAI_API_URL = "https://api.z.ai/api/paas/v4/chat/completions"
 
 # --- КЛАВИАТУРЫ ---
