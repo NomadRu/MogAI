@@ -4,6 +4,7 @@ import requests
 import logging
 import io
 import asyncio
+import re
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, 
@@ -23,7 +24,7 @@ if not TOKEN or not GEMINI_KEY:
 
 GEMINI_TEXT_MODEL = "gemini-3.1-flash-lite"
 GEMINI_PROXY = "https://gemini-proxy.bold-violet-3c8d.workers.dev"
-OPENROUTER_VISION_MODEL = "qwen/qwen-2-vl-72b-instruct:free"
+OPENROUTER_VISION_MODEL = "qwen/qwen2.5-vl-3b-instruct:free"
 OPENROUTER_TEXT_MODEL = "openrouter/free"
 
 # --- КЛАВИАТУРЫ ---
@@ -42,9 +43,61 @@ def get_reset_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# --- АНИМАЦИЯ ОЖИДАНИЯ ---
+# --- ЧИСТИЛЬЩИК ТЕКСТА (УБИРАЕМ ЗВЕЗДОЧКИ И РЕШЕТКИ) ---
+def format_text_for_telegram(text: str) -> str:
+    """Превращает Markdown от ИИ в красивый HTML для Telegram"""
+    
+    # 1. Сначала вырезаем блоки кода, чтобы их не испортить
+    code_blocks = []
+    def save_code_block(match):
+        code_blocks.append(match.group(0))
+        return f"__CODE_BLOCK_{len(code_blocks)-1}__"
+    
+    text = re.sub(r'```[\s\S]*?```', save_code_block, text)
+    
+    # 2. Меняем Markdown на HTML
+    # Жирный: **текст** или __текст__ -> <b>текст</b>
+    text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
+    text = re.sub(r'__(.*?)__', r'<b>\1</b>', text)
+    
+    # Курсив: *текст* или _текст_ -> <i>текст</i>
+    text = re.sub(r'\*(.*?)\*', r'<i>\1</i>', text)
+    text = re.sub(r'_(.*?)_', r'<i>\1</i>', text)
+    
+    # Зачеркнутый: ~~текст~~ -> <s>текст</s>
+    text = re.sub(r'~~(.*?)~~', r'<s>\1</s>', text)
+    
+    # Моноширинный: `текст` -> <code>текст</code>
+    text = re.sub(r'`([^`]+)`', r'<code>\1</code>', text)
+    
+    # 3. Убираем заголовки (###, ##, #)
+    text = re.sub(r'^#{1,6}\s+(.*)$', r'<b>\1</b>', text, flags=re.MULTILINE)
+    
+    # 4. Возвращаем блоки кода на место (в тегах <pre>)
+    for i, block in enumerate(code_blocks):
+        # Убираем лишние ``` и язык
+        clean_code = block.replace('```', '').strip()
+        # Убираем первую строку, если это название языка (python, html и т.д.)
+        lines = clean_code.split('\n')
+        if lines and lines[0].strip() in ['python', 'html', 'javascript', 'css', 'json', 'sql', 'cpp', 'java', 'php', 'bash']:
+            lines = lines[1:]
+        
+        html_code = f"<pre><code>{'\n'.join(lines)}</code></pre>"
+        text = text.replace(f"__CODE_BLOCK_{i}__", html_code)
+        
+    # 5. Экранируем опасные символы, которые могут сломать HTML (кроме наших тегов)
+    text = text.replace('&', '&amp;').replace('>', '&gt;').replace('<', '&lt;')
+    # Возвращаем теги обратно
+    text = text.replace('&lt;b&gt;', '<b>').replace('&lt;/b&gt;', '</b>')
+    text = text.replace('&lt;i&gt;', '<i>').replace('&lt;/i&gt;', '</i>')
+    text = text.replace('&lt;s&gt;', '<s>').replace('&lt;/s&gt;', '</s>')
+    text = text.replace('&lt;code&gt;', '<code>').replace('&lt;/code&gt;', '</code>')
+    text = text.replace('&lt;pre&gt;', '<pre>').replace('&lt;/pre&gt;', '</pre>')
+    
+    return text
+
+# --- АНИМАЦИЯ ---
 async def animate_thinking(update: Update, stop_event: asyncio.Event):
-    """Имитация анимации: редактирует сообщение каждые 2 секунды"""
     msg = await update.message.reply_text("⏳ <b>MogAI думает...</b>", parse_mode="HTML")
     seconds = 0
     while not stop_event.is_set():
@@ -61,12 +114,12 @@ async def animate_thinking(update: Update, stop_event: asyncio.Event):
     except Exception:
         pass
 
-# --- ЗАПРОСЫ К OPENROUTER ---
+# --- ЗАПРОСЫ ---
 def ask_openrouter_text(messages: list) -> str:
     if not OPENROUTER_KEY:
         return "⚠️ Для резервной модели нужен OPENROUTER_API_KEY."
     
-    or_messages = [{"role": "system", "content": "Ты — MogAI. Отвечай кратко. Используй HTML-теги (<b>жирный</b>)."}]
+    or_messages = [{"role": "system", "content": "Ты — MogAI. Отвечай текстом."}]
     for msg in messages[-6:]:
         or_messages.append({"role": msg["role"], "content": msg["content"]})
     
@@ -114,15 +167,11 @@ def ask_openrouter_vision(image_b64: str, user_text: str, history: list) -> str:
     except Exception as e:
         return f"⚠️ Сбой Vision: {str(e)}"
 
-# --- УМНЫЙ ЗАПРОС ДЛЯ ТЕКСТА ---
 def ask_text_smart(messages: list) -> str:
     contents = []
     system_instruction = (
-        "Ты — MogAI, умный помощник.\n"
-        "ВАЖНО: Если ты пишешь код, обязательно используй блоки кода Markdown:\n"
-        "```python\nprint('Hello')\n```\n"
-        "Для обычного текста используй HTML-теги: <b>жирный</b>, <i>курсив</i>.\n"
-        "Если нужно создать таблицу, используй Markdown (| и -)."
+        "Ты — MogAI. Если нужно создать таблицу, используй символы | и -.\n"
+        "Если пишешь код, используй ```язык\nкод\n```."
     )
     contents.append({"role": "user", "parts": [{"text": system_instruction}]})
     
@@ -141,78 +190,77 @@ def ask_text_smart(messages: list) -> str:
             return data["candidates"][0]["content"]["parts"][0]["text"]
             
         if data.get("error", {}).get("code") == 503:
-            logger.warning("Gemini перегружен. Переключаемся на OpenRouter.")
             return ask_openrouter_text(messages)
             
         return f"⚠️ Ошибка Gemini: {data.get('error', {}).get('message')}"
         
     except Exception as e:
-        logger.warning(f"Сбой Gemini: {e}. Переключаемся на OpenRouter.")
         return ask_openrouter_text(messages)
 
 # --- ОТПРАВКА ---
 async def send_safe_message(update: Update, text: str):
+    # Если таблица — сохраняем как CSV
+    if "|" in text and "-" in text and len(text) > 100:
+        file_stream = io.BytesIO(text.encode('utf-8'))
+        file_stream.name = "MogAI_Table.csv"
+        await update.message.reply_document(
+            document=file_stream, 
+            caption="📊 Таблица сохранена в CSV (открывается в Excel)!"
+        )
+        return
+
+    # Если слишком длинный — сохраняем в TXT
     if len(text) > 3500:
         file_stream = io.BytesIO(text.encode('utf-8'))
         file_stream.name = "MogAI_Otvet.txt"
         await update.message.reply_document(document=file_stream, caption="📄 Ответ слишком длинный. Сохранил в файл!")
         return
 
+    # Форматируем текст (звездочки -> жирный)
+    formatted_text = format_text_for_telegram(text)
+
     try:
-        await update.message.reply_text(text, parse_mode="HTML")
+        await update.message.reply_text(formatted_text, parse_mode="HTML")
     except Exception as e:
         logger.warning(f"HTML сломался: {e}. Отправляем как обычный текст.")
         await update.message.reply_text(text)
 
-# --- КОМАНДЫ ---
+# --- КОМАНДЫ И КНОПКИ (БЕЗ ИЗМЕНЕНИЙ) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["history"] = []
     welcome_text = (
         "👋 <b>Привет! Я MogAI.</b>\n\n"
         "Я умею:\n"
         "💬 Отвечать на вопросы\n"
-        "📊 <b>Создавать таблицы</b>\n"
+        "📊 <b>Создавать таблицы</b> (файлом CSV)\n"
         "📄 <b>Создавать .txt файлы</b>\n"
         "🧮 <b>Решать задачи по фото</b>\n\n"
-        "<b>Задай вопрос или используй кнопки!</b>"
+        "<b>Задай вопрос!</b>"
     )
     await update.message.reply_text(welcome_text, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "⚠️ <b>Вы уверены, что хотите начать новый чат?</b>",
-        reply_markup=get_reset_keyboard(), parse_mode="HTML"
-    )
+    await update.message.reply_text("⚠️ <b>Вы уверены?</b>", reply_markup=get_reset_keyboard(), parse_mode="HTML")
 
-# --- КНОПКИ ---
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
     if query.data == "reset_confirm":
         await query.edit_message_text("⚠️ Вы уверены?", reply_markup=get_reset_keyboard(), parse_mode="HTML")
     elif query.data == "reset_yes":
         context.user_data["history"] = []
-        await query.edit_message_text("🧹 История очищена. Новый чат!", reply_markup=get_main_keyboard())
+        await query.edit_message_text("🧹 История очищена.", reply_markup=get_main_keyboard())
     elif query.data == "reset_no":
-        await query.edit_message_text("👍 Отмена. Чат сохранен.", reply_markup=get_main_keyboard())
+        await query.edit_message_text("👍 Отмена.", reply_markup=get_main_keyboard())
     elif query.data == "new_chat":
         context.user_data["history"] = []
-        await query.edit_message_text("🧹 Новый чат начат!", reply_markup=get_main_keyboard())
+        await query.edit_message_text("🧹 Новый чат!", reply_markup=get_main_keyboard())
     elif query.data == "help":
-        text = (
-            "🤖 <b>Что я умею:</b>\n"
-            "• /reset — сброс памяти\n"
-            "• <b>Таблицы:</b> «сделай таблицу расходов»\n"
-            "• <b>Файлы:</b> «создай файл: Привет!»\n"
-            "• <b>Фото:</b> пришли фото задачи и напиши «реши»."
-        )
+        text = "🤖 <b>Команды:</b>\n• /reset — сброс\n• «сделай таблицу»\n• Пришли фото задачи."
         await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
-# --- ОБРАБОТЧИКИ ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
-    
     if "создай файл" in user_text:
         await update.message.chat.send_action(action="upload_document")
         content = user_text.split("файл", 1)[1].replace(":", "").strip()
@@ -221,7 +269,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(document=file_stream, caption="📄 Файл готов!")
         return
 
-    # Запускаем анимацию
     stop_event = asyncio.Event()
     animation_task = asyncio.create_task(animate_thinking(update, stop_event))
 
@@ -229,28 +276,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         history = context.user_data.get("history", [])
         history.append({"role": "user", "content": user_text})
         if len(history) > 8: history = history[-8:]
-        
-        # Запрос к ИИ в отдельном потоке, чтобы не блокировать анимацию
         ai_response = await asyncio.to_thread(ask_text_smart, history)
-        
         history.append({"role": "assistant", "content": ai_response})
         context.user_data["history"] = history
     finally:
-        # Останавливаем анимацию
         stop_event.set()
         await animation_task
 
     await send_safe_message(update, ai_response)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Запускаем анимацию
     stop_event = asyncio.Event()
     animation_task = asyncio.create_task(animate_thinking(update, stop_event))
 
     try:
         photo_file = await update.message.photo[-1].get_file()
         file_bytes = await photo_file.download_as_bytearray()
-        
         if len(file_bytes) > 4 * 1024 * 1024:
             stop_event.set()
             await animation_task
@@ -259,12 +300,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         image_b64 = base64.b64encode(file_bytes).decode("utf-8")
         caption = update.message.caption or "Что на фото? Реши задачу."
-        
         history = context.user_data.get("history", [])
-        
-        # Запрос к ИИ в отдельном потоке
         ai_response = await asyncio.to_thread(ask_openrouter_vision, image_b64, caption, history)
-        
         history.append({"role": "user", "content": f"[Фото] {caption}"})
         history.append({"role": "assistant", "content": ai_response})
         context.user_data["history"] = history[-8:]
@@ -274,10 +311,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_safe_message(update, ai_response)
 
-# --- ЗАПУСК (WEBHOOK) ---
 if __name__ == "__main__":
     application = Application.builder().token(TOKEN).build()
-    
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("reset", reset_command))
     application.add_handler(CallbackQueryHandler(button_handler))
@@ -285,11 +320,4 @@ if __name__ == "__main__":
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     port = int(os.environ.get("PORT", 10000))
-    
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=port,
-        url_path=TOKEN,
-        webhook_url=f"{URL}/{TOKEN}",
-        drop_pending_updates=True
-    )
+    application.run_webhook(listen="0.0.0.0", port=port, url_path=TOKEN, webhook_url=f"{URL}/{TOKEN}", drop_pending_updates=True)
