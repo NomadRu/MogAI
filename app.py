@@ -6,7 +6,6 @@ import io
 import asyncio
 import re
 import time
-import json
 import traceback
 from docx import Document
 from docx.shared import Pt, Cm
@@ -183,12 +182,12 @@ def ask_gemini_vision(image_b64: str, user_text: str) -> str:
 
 # --- СОЗДАНИЕ РЕФЕРАТА ПО ГОСТУ ---
 def create_gost_document(topic: str) -> io.BytesIO:
-    # 1. Просим ИИ написать текст реферата
+    logger.info(f"Запуск создания реферата на тему: {topic}")
     prompt = (
         f"Напиши текст для реферата на тему: '{topic}'. "
         "Структура: Введение (актуальность), Основная часть (2-3 раздела), Заключение, Список литературы. "
-        "Объем текста: примерно 1500-2000 слов. Пиши академическим языком. "
-        "НЕ используй Markdown-разметку (звездочки, решетки), просто чистый текст с абзацами. "
+        "Объем текста: примерно 1000-1500 слов. Пиши академическим языком. "
+        "НЕ используй Markdown-разметку. Пиши просто чистый текст с абзацами. "
         "Заголовки разделов пиши с новой строки и выделяй их заглавными буквами (например: ВВЕДЕНИЕ)."
     )
     url = f"{GEMINI_PROXY}/v1beta/models/{GEMINI_TEXT_MODELS[0]}:generateContent?key={GEMINI_KEY}"
@@ -203,36 +202,30 @@ def create_gost_document(topic: str) -> io.BytesIO:
             return None
             
         raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-        # Убираем возможные артефакты Markdown
-        raw_text = re.sub(r'\*\*|__|\*|_|#', '', raw_text)
+        raw_text = re.sub(r'[*#_`~]', '', raw_text)
+        raw_text = "".join(c for c in raw_text if c.isprintable() or c in '\n\r\t')
         
     except Exception as e:
         logger.error(f"Ошибка при запросе к Google (реферат): {e}")
         return None
 
-    # 2. Собираем Word-документ по ГОСТу
     try:
         doc = Document()
-        
-        # Настройка стилей по ГОСТ (Times New Roman, 14, полуторный интервал)
         style = doc.styles['Normal']
         style.font.name = 'Times New Roman'
         style.font.size = Pt(14)
         
-        # Настройка полей (левое 3 см, правое 1.5 см, верхнее/нижнее 2 см)
         for section in doc.sections:
             section.left_margin = Cm(3)
             section.right_margin = Cm(1.5)
             section.top_margin = Cm(2)
             section.bottom_margin = Cm(2)
             
-        # Функция для добавления абзаца с правильным форматированием
         def add_gost_paragraph(text, is_heading=False):
             p = doc.add_paragraph()
             p.paragraph_format.line_spacing_rule = WD_LINE_SPACING.ONE_POINT_FIVE
-            p.paragraph_format.first_line_indent = Cm(1.25) # Красная строка
+            p.paragraph_format.first_line_indent = Cm(1.25)
             p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-            
             if is_heading:
                 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 p.paragraph_format.first_line_indent = Cm(0)
@@ -242,13 +235,11 @@ def create_gost_document(topic: str) -> io.BytesIO:
                 p.add_run(text)
             return p
 
-        # Титульный лист (упрощенный)
         title_p = doc.add_paragraph()
         title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = title_p.add_run("РЕФЕРАТ")
         run.bold = True
         run.font.size = Pt(20)
-        
         doc.add_paragraph()
         
         topic_p = doc.add_paragraph()
@@ -256,27 +247,24 @@ def create_gost_document(topic: str) -> io.BytesIO:
         run = topic_p.add_run(f"на тему: «{topic}»")
         run.bold = True
         run.font.size = Pt(16)
-        
         doc.add_paragraph("\n\n\n\n\n\n\n\n\n\n")
         
-        # Разбиваем текст на строки и добавляем в документ
         lines = raw_text.split('\n')
         for line in lines:
             line = line.strip()
             if not line: continue
-            
-            # Если строка похожа на заголовок (короткая, заглавные буквы)
-            if len(line) < 50 and (line.isupper() or line.endswith(':')):
+            if len(line) < 60 and (line.isupper() or line.endswith(':')):
                 add_gost_paragraph(line, is_heading=True)
-                doc.add_paragraph() # Пустая строка после заголовка
+                doc.add_paragraph()
             else:
                 add_gost_paragraph(line)
                 
         buf = io.BytesIO()
         doc.save(buf); buf.seek(0)
+        logger.info("Word-документ успешно собран!")
         return buf
     except Exception as e:
-        logger.error(f"Ошибка при сборке DOCX: {e}")
+        logger.error(f"Ошибка при сборке DOCX: {e}\n{traceback.format_exc()}")
         return None
 
 # --- ОТПРАВКА ---
@@ -340,7 +328,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user_text = update.message.text.lower()
         
-        # 1. СОЗДАНИЕ РЕФЕРАТА
         if "реферат" in user_text or "доклад" in user_text:
             match = re.search(r'(?:на тему|про)\s+(.+)', user_text)
             topic = match.group(1) if match else "Интересные факты"
@@ -359,12 +346,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         parse_mode="HTML"
                     )
                 else: 
-                    await update.message.reply_text("⚠️ Не удалось создать реферат. Возможно, тема слишком сложная или Google перегружен.")
+                    await update.message.reply_text("⚠️ Не удалось создать реферат. Проверьте логи Render.")
             finally:
                 stop_event.set(); await anim
             return
 
-        # 2. СОЗДАНИЕ ПРОСТОГО ФАЙЛА
         if "создай файл" in user_text:
             await update.message.chat.send_action(action="upload_document")
             content = user_text.split("файл", 1)[1].replace(":", "").strip()
@@ -372,7 +358,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_document(document=file_stream, caption="📄 Файл готов!")
             return
 
-        # 3. ОБЫЧНЫЙ ЧАТ
         stop_event = asyncio.Event(); context.user_data["stop_event"] = stop_event
         anim = asyncio.create_task(animate_thinking(update, stop_event))
         try:
@@ -392,7 +377,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Обработка фото осталась без изменений
     try:
         stop_event = asyncio.Event(); context.user_data["stop_event"] = stop_event
         anim = asyncio.create_task(animate_thinking(update, stop_event))
