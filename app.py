@@ -31,14 +31,17 @@ logger = logging.getLogger(__name__)
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 URL = os.environ.get("RENDER_EXTERNAL_URL")
 GROQ_KEY = os.environ.get("GROQ_API_KEY")
+MISTRAL_KEY = os.environ.get("MISTRAL_API_KEY") # Ключ для фото
 
 if not TOKEN or not GROQ_KEY:
     raise ValueError("Не заданы TELEGRAM_TOKEN или GROQ_API_KEY!")
 
-# --- МОДЕЛИ GROQ ---
+# --- МОДЕЛИ ---
 GROQ_TEXT_MODELS = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "openai/gpt-oss-20b"]
-GROQ_VISION_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+MISTRAL_VISION_MODEL = "pixtral-12b-2409"
+MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 
 # --- КЛАВИАТУРЫ ---
 def get_main_keyboard():
@@ -170,49 +173,36 @@ def ask_groq_text(messages: list) -> str:
         except Exception: continue
     return "⚠️ Ошибка Groq."
 
-# --- ЗАПРОСЫ К GROQ (ФОТО) ---
-def ask_groq_vision(image_b64: str, user_text: str, history: list) -> str:
-    history_text = ""
-    for msg in history[-4:]:
-        role_name = "Пользователь" if msg["role"] == "user" else "MogAI"
-        content = "[Фото]" if isinstance(msg["content"], list) else msg["content"]
-        history_text += f"{role_name}: {content}\n"
-    
-    full_prompt = f"Предыдущий диалог:\n{history_text}\n\nТекущий вопрос: {user_text or 'Реши задачу на фото.'}"
+# --- ЗАПРОСЫ К MISTRAL (ФОТО) ---
+def ask_mistral_vision(image_b64: str, user_text: str) -> str:
+    if not MISTRAL_KEY: 
+        return "⚠️ Для фото нужен MISTRAL_API_KEY."
 
     messages = [
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": full_prompt},
+                {"type": "text", "text": user_text or "Реши задачи на фото. Распиши пошагово."},
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
             ]
         }
     ]
 
-    last_error = "Vision-модель не найдена"
-    for model in GROQ_VISION_MODELS:
-        try:
-            response = requests.post(
-                url=GROQ_API_URL,
-                headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-                json={"model": model, "messages": messages, "max_tokens": 3000},
-                timeout=60
-            )
-            data = response.json()
+    try:
+        response = requests.post(
+            url=MISTRAL_API_URL,
+            headers={"Authorization": f"Bearer {MISTRAL_KEY}", "Content-Type": "application/json"},
+            json={"model": MISTRAL_VISION_MODEL, "messages": messages, "max_tokens": 4000},
+            timeout=60
+        )
+        data = response.json()
+        
+        if "error" in data:
+            return f"⚠️ Ошибка Mistral (фото): {data['error'].get('message')}"
             
-            if "error" not in data and "choices" in data:
-                return data["choices"][0]["message"]["content"]
-                
-            err_msg = data.get("error", {}).get("message", "")
-            last_error = err_msg
-            logger.warning(f"Groq Vision {model} не сработала: {err_msg}")
-
-        except Exception as e:
-            last_error = str(e)
-            continue
-            
-    return f"⚠️ Ошибка Groq (фото): {last_error}"
+        return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"⚠️ Сбой Mistral (фото): {e}"
 
 # --- СОЗДАНИЕ РЕФЕРАТА ---
 def create_gost_document(topic: str) -> io.BytesIO:
@@ -289,7 +279,7 @@ async def send_safe_message(update: Update, text: str):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["history"] = []
     text = (
-        "👋 <b>Привет! Я MogAI (на базе Groq).</b>\n\n"
+        "👋 <b>Привет! Я MogAI.</b>\n\n"
         "Я умею:\n"
         "💬 Отвечать на вопросы\n"
         "📊 <b>Создавать таблицы</b>\n"
@@ -375,19 +365,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             image_b64 = base64.b64encode(file_bytes).decode("utf-8")
             caption = update.message.caption or "Реши задачи на фото."
             
-            history = context.user_data.get("history", [])
-            
-            # Идем в Groq Vision
-            ai_response = await asyncio.to_thread(ask_groq_vision, image_b64, caption, history)
+            # Идем в Mistral
+            ai_response = await asyncio.to_thread(ask_mistral_vision, image_b64, caption)
             
             if stop_event.is_set(): return
             
-            # Проверка на ошибку
             if "⚠️" in ai_response:
                 await update.message.reply_text(ai_response)
                 return
 
-            # Создаем HTML файл
             safe_response = ai_response.replace('\n', '<br>')
             html_content = f"""<!DOCTYPE html>
 <html lang="ru">
@@ -410,10 +396,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             file_stream = io.BytesIO(html_content.encode('utf-8'))
             file_stream.name = "Reshenie.html"
-            await update.message.reply_document(document=file_stream, caption="📄 Вот HTML-файл с решением задачи! Открой его в браузере.")
+            await update.message.reply_document(document=file_stream, caption="📄 Вот HTML-файл с решением задачи!")
             
+            history = context.user_data.get("history", [])
             history.append({"role": "user", "content": f"[Фото задачи] {caption}"})
-            history.append({"role": "assistant", "content": "Решение задачи было отправлено в HTML-файле."})
+            history.append({"role": "assistant", "content": "Решение отправлено в HTML."})
             context.user_data["history"] = history[-8:]
             
         finally:
