@@ -31,17 +31,14 @@ logger = logging.getLogger(__name__)
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 URL = os.environ.get("RENDER_EXTERNAL_URL")
 GROQ_KEY = os.environ.get("GROQ_API_KEY")
-GEMINI_KEY = os.environ.get("GEMINI_KEY_1") # Ключ для фото
 
 if not TOKEN or not GROQ_KEY:
     raise ValueError("Не заданы TELEGRAM_TOKEN или GROQ_API_KEY!")
 
-# --- МОДЕЛИ ---
+# --- МОДЕЛИ GROQ ---
 GROQ_TEXT_MODELS = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "openai/gpt-oss-20b"]
+GROQ_VISION_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-
-GEMINI_VISION_MODEL = "gemini-3.5-flash"
-GEMINI_PROXY = "https://gemini-proxy.bold-violet-3c8d.workers.dev"
 
 # --- КЛАВИАТУРЫ ---
 def get_main_keyboard():
@@ -60,11 +57,10 @@ def get_reset_keyboard():
 def get_stop_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Остановить", callback_data="stop_thinking")]])
 
-# --- УМНЫЙ ПАРСЕР ТАБЛИЦ (РИСУЕТ ДАЖЕ ДЛИННЫЕ) ---
+# --- ПАРСЕР ТАБЛИЦ В PNG ---
 def markdown_to_png(text: str) -> io.BytesIO:
     if not HAS_MATPLOTLIB: return None
     try:
-        # 1. Убираем блоки кода, если нейросеть обернула таблицу в них
         clean_text = re.sub(r'```[a-zA-Z]*\n?', '', text)
         clean_text = re.sub(r'```', '', clean_text)
         
@@ -74,13 +70,11 @@ def markdown_to_png(text: str) -> io.BytesIO:
             clean_line = line.strip()
             if "|" in clean_line:
                 parts = [part.strip() for part in clean_line.strip('|').split('|')]
-                # Пропускаем разделители (---)
                 if all(re.match(r'^:?-+:?$', p) for p in parts if p): continue
                 if any(p for p in parts): table_data.append(parts)
                 
         if len(table_data) < 2: return None
         
-        # Убираем звездочки от Markdown из ячеек
         for row in table_data:
             for i in range(len(row)):
                 row[i] = row[i].replace('**', '').replace('*', '')
@@ -89,7 +83,6 @@ def markdown_to_png(text: str) -> io.BytesIO:
         for row in table_data:
             while len(row) < max_cols: row.append("")
             
-        # Делаем картинку широкой, чтобы влез длинный текст
         fig, ax = plt.subplots(figsize=(14, max(2, len(table_data) * 0.8)))
         ax.axis('tight'); ax.axis('off')
         
@@ -99,7 +92,7 @@ def markdown_to_png(text: str) -> io.BytesIO:
         table.scale(1, 2.5)
         
         for (row, col), cell in table.get_celld().items():
-            cell.set_text_props(wrap=True) # Разрешаем перенос строк
+            cell.set_text_props(wrap=True)
             if row == 0:
                 cell.set_text_props(weight='bold', color='white'); cell.set_facecolor('#4a4a4a')
             else: 
@@ -177,25 +170,49 @@ def ask_groq_text(messages: list) -> str:
         except Exception: continue
     return "⚠️ Ошибка Groq."
 
-# --- ЗАПРОСЫ К GEMINI (ФОТО) ---
-def ask_gemini_vision(image_b64: str, user_text: str) -> str:
-    if not GEMINI_KEY: return "⚠️ Для фото нужен GEMINI_KEY_1."
-    url = f"{GEMINI_PROXY}/v1beta/models/{GEMINI_VISION_MODEL}:generateContent?key={GEMINI_KEY}"
-    try:
-        response = requests.post(
-            url=url, headers={"Content-Type": "application/json"},
-            json={
-                "contents": [{"parts": [
-                    {"text": user_text or "Реши задачи на фото. Распиши пошагово."},
-                    {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}}
-                ]}],
-                "generationConfig": {"maxOutputTokens": 4000}
-            }, timeout=60
-        )
-        data = response.json()
-        if "error" in data: return f"⚠️ Ошибка Google (фото): {data['error'].get('message')}"
-        return data["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception as e: return f"⚠️ Сбой Google (фото): {e}"
+# --- ЗАПРОСЫ К GROQ (ФОТО) ---
+def ask_groq_vision(image_b64: str, user_text: str, history: list) -> str:
+    history_text = ""
+    for msg in history[-4:]:
+        role_name = "Пользователь" if msg["role"] == "user" else "MogAI"
+        content = "[Фото]" if isinstance(msg["content"], list) else msg["content"]
+        history_text += f"{role_name}: {content}\n"
+    
+    full_prompt = f"Предыдущий диалог:\n{history_text}\n\nТекущий вопрос: {user_text or 'Реши задачу на фото.'}"
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": full_prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
+            ]
+        }
+    ]
+
+    last_error = "Vision-модель не найдена"
+    for model in GROQ_VISION_MODELS:
+        try:
+            response = requests.post(
+                url=GROQ_API_URL,
+                headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+                json={"model": model, "messages": messages, "max_tokens": 3000},
+                timeout=60
+            )
+            data = response.json()
+            
+            if "error" not in data and "choices" in data:
+                return data["choices"][0]["message"]["content"]
+                
+            err_msg = data.get("error", {}).get("message", "")
+            last_error = err_msg
+            logger.warning(f"Groq Vision {model} не сработала: {err_msg}")
+
+        except Exception as e:
+            last_error = str(e)
+            continue
+            
+    return f"⚠️ Ошибка Groq (фото): {last_error}"
 
 # --- СОЗДАНИЕ РЕФЕРАТА ---
 def create_gost_document(topic: str) -> io.BytesIO:
@@ -272,12 +289,12 @@ async def send_safe_message(update: Update, text: str):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["history"] = []
     text = (
-        "👋 <b>Привет! Я MogAI.</b>\n\n"
+        "👋 <b>Привет! Я MogAI (на базе Groq).</b>\n\n"
         "Я умею:\n"
         "💬 Отвечать на вопросы\n"
         "📊 <b>Создавать таблицы</b>\n"
         "📝 <b>Писать рефераты по ГОСТу</b> (.docx)\n"
-        "🧮 <b>Решать задачи по фото</b> (через Google, пришлю HTML)\n\n"
+        "🧮 <b>Решать задачи по фото</b> (пришлю HTML)\n\n"
         "Напиши: <i>«напиши реферат на тему [тема]»</i> или пришли фото задачи."
     )
     await update.message.reply_text(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
@@ -358,11 +375,19 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             image_b64 = base64.b64encode(file_bytes).decode("utf-8")
             caption = update.message.caption or "Реши задачи на фото."
             
-            ai_response = await asyncio.to_thread(ask_gemini_vision, image_b64, caption)
+            history = context.user_data.get("history", [])
+            
+            # Идем в Groq Vision
+            ai_response = await asyncio.to_thread(ask_groq_vision, image_b64, caption, history)
             
             if stop_event.is_set(): return
             
-            # Создаем HTML файл (заменили chr(10) на \n)
+            # Проверка на ошибку
+            if "⚠️" in ai_response:
+                await update.message.reply_text(ai_response)
+                return
+
+            # Создаем HTML файл
             safe_response = ai_response.replace('\n', '<br>')
             html_content = f"""<!DOCTYPE html>
 <html lang="ru">
@@ -387,7 +412,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_stream.name = "Reshenie.html"
             await update.message.reply_document(document=file_stream, caption="📄 Вот HTML-файл с решением задачи! Открой его в браузере.")
             
-            history = context.user_data.get("history", [])
             history.append({"role": "user", "content": f"[Фото задачи] {caption}"})
             history.append({"role": "assistant", "content": "Решение задачи было отправлено в HTML-файле."})
             context.user_data["history"] = history[-8:]
