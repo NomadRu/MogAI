@@ -30,10 +30,19 @@ logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 URL = os.environ.get("RENDER_EXTERNAL_URL")
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
+OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
 
-if not TOKEN or not GEMINI_KEY:
-    raise ValueError("Не заданы TELEGRAM_TOKEN или GEMINI_API_KEY!")
+if not TOKEN:
+    raise ValueError("Не задан TELEGRAM_TOKEN!")
+
+# Собираем все ключи Google (от 1 до 5)
+def get_gemini_keys():
+    keys = []
+    for i in range(1, 6):
+        key = os.environ.get(f"GEMINI_KEY_{i}")
+        if key:
+            keys.append(key)
+    return keys
 
 GEMINI_TEXT_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
 GEMINI_VISION_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
@@ -130,84 +139,115 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: await query.edit_message_text("⏹ <b>Запрос отменён.</b>", parse_mode="HTML")
     except Exception: pass
 
-# --- ЗАПРОСЫ К GEMINI ---
+# --- УМНЫЕ ЗАПРОСЫ С ПЕРЕБОРОМ КЛЮЧЕЙ ---
 def ask_gemini_text(messages: list) -> str:
     contents = []
-    system_instruction = (
-        "Ты — MogAI. Отвечай обычным текстом. "
-        "Используй таблицы ТОЛЬКО если пользователь ЯВНО попросил 'таблицу'. "
-        "Код оформляй в ```язык ... ```."
-    )
+    system_instruction = "Ты — MogAI. Отвечай обычным текстом. Используй таблицы ТОЛЬКО если попросили."
     contents.append({"role": "user", "parts": [{"text": system_instruction}]})
     for msg in messages:
         role = "user" if msg["role"] == "user" else "model"
         contents.append({"role": role, "parts": [{"text": msg["content"]}]})
 
-    for model in GEMINI_TEXT_MODELS:
-        url = f"{GEMINI_PROXY}/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
-        for attempt in range(2):
+    keys = get_gemini_keys()
+    if not keys:
+        return ask_openrouter_text(messages)
+
+    for key_index, key in enumerate(keys):
+        for model in GEMINI_TEXT_MODELS:
+            url = f"{GEMINI_PROXY}/v1beta/models/{model}:generateContent?key={key}"
             try:
                 response = requests.post(url=url, headers={"Content-Type": "application/json"}, 
-                    json={"contents": contents, "generationConfig": {"maxOutputTokens": 3000}}, timeout=30)
+                    json={"contents": contents, "generationConfig": {"maxOutputTokens": 3000}}, timeout=20)
                 data = response.json()
+                
                 if "error" not in data and "candidates" in data:
                     return data["candidates"][0]["content"]["parts"][0]["text"]
-                code = data.get("error", {}).get("code")
-                if code in (503, 429): time.sleep(1 + attempt); continue
-                return f"⚠️ Ошибка Google: {data.get('error', {}).get('message')}"
-            except Exception: time.sleep(1); continue
-    return "⚠️ Google не отвечает."
+                
+                if data.get("error", {}).get("code") == 429:
+                    logger.warning(f"Ключ №{key_index + 1} исчерпан. Переключаюсь...")
+                    break # Переходим к следующему ключу
+            except Exception: continue
+
+    logger.warning("Все ключи Google исчерпаны. Иду в OpenRouter.")
+    return ask_openrouter_text(messages)
 
 def ask_gemini_vision(image_b64: str, user_text: str) -> str:
-    last_error = "Все модели Google Vision недоступны"
-    for model in GEMINI_VISION_MODELS:
-        url = f"{GEMINI_PROXY}/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
-        for attempt in range(2):
+    keys = get_gemini_keys()
+    if not keys: return "⚠️ Нет ключей Google."
+
+    for key_index, key in enumerate(keys):
+        for model in GEMINI_VISION_MODELS:
+            url = f"{GEMINI_PROXY}/v1beta/models/{model}:generateContent?key={key}"
             try:
                 response = requests.post(url=url, headers={"Content-Type": "application/json"}, 
                     json={"contents": [{"parts": [{"text": user_text}, {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}}]}]}, timeout=40)
                 data = response.json()
                 if "error" not in data and "candidates" in data:
                     return data["candidates"][0]["content"]["parts"][0]["text"]
-                code = data.get("error", {}).get("code")
-                err_msg = data.get("error", {}).get("message", "")
-                last_error = f"{model}: {err_msg}"
-                if code in (503, 429): time.sleep(1 + attempt); continue
-                if code == 404 or "not found" in err_msg.lower(): break
-                return f"⚠️ Ошибка Google (фото): {err_msg}"
-            except Exception as e:
-                last_error = f"{model}: {str(e)}"
-                time.sleep(1); continue
-    return f"⚠️ Ошибка обработки фото: {last_error}"
+                if data.get("error", {}).get("code") == 429:
+                    break # Следующий ключ
+            except Exception: continue
+    return "⚠️ Все ключи Google для фото исчерпаны."
 
-# --- СОЗДАНИЕ РЕФЕРАТА ПО ГОСТУ ---
+def ask_openrouter_text(messages: list) -> str:
+    if not OPENROUTER_KEY: return "⚠️ Все ключи Google исчерпаны, а OpenRouter не настроен."
+    or_messages = [{"role": "system", "content": "Ты — MogAI. Отвечай текстом."}]
+    for msg in messages[-6:]: or_messages.append({"role": msg["role"], "content": msg["content"]})
+    try:
+        response = requests.post("https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"},
+            json={"model": "openrouter/free", "messages": or_messages, "max_tokens": 3000}, timeout=30)
+        data = response.json()
+        if "error" in data: return f"⚠️ OpenRouter: {data['error'].get('message')}"
+        return data["choices"][0]["message"]["content"]
+    except Exception as e: return f"⚠️ Сбой: {e}"
+
+# --- СОЗДАНИЕ РЕФЕРАТА (С ПЕРЕБОРОМ КЛЮЧЕЙ) ---
 def create_gost_document(topic: str) -> io.BytesIO:
-    logger.info(f"Запуск создания реферата на тему: {topic}")
     prompt = (
         f"Напиши текст для реферата на тему: '{topic}'. "
-        "Структура: Введение (актуальность), Основная часть (2-3 раздела), Заключение, Список литературы. "
-        "Объем текста: примерно 1000-1500 слов. Пиши академическим языком. "
-        "НЕ используй Markdown-разметку. Пиши просто чистый текст с абзацами. "
-        "Заголовки разделов пиши с новой строки и выделяй их заглавными буквами (например: ВВЕДЕНИЕ)."
+        "Структура: Введение, Основная часть, Заключение. Объем: 1000-1500 слов. "
+        "Пиши чистым текстом без Markdown. Заголовки пиши ЗАГЛАВНЫМИ буквами."
     )
-    url = f"{GEMINI_PROXY}/v1beta/models/{GEMINI_TEXT_MODELS[0]}:generateContent?key={GEMINI_KEY}"
     
-    try:
-        response = requests.post(url=url, headers={"Content-Type": "application/json"}, 
-            json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 4000}}, timeout=60)
-        data = response.json()
-        
-        if "error" in data:
-            logger.error(f"Google API Error (реферат): {data['error']}")
-            return None
-            
-        raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-        raw_text = re.sub(r'[*#_`~]', '', raw_text)
-        raw_text = "".join(c for c in raw_text if c.isprintable() or c in '\n\r\t')
-        
-    except Exception as e:
-        logger.error(f"Ошибка при запросе к Google (реферат): {e}")
-        return None
+    raw_text = ""
+    keys = get_gemini_keys()
+
+    # Ищем текст в Google
+    for key_index, key in enumerate(keys):
+        for model in GEMINI_TEXT_MODELS:
+            url = f"{GEMINI_PROXY}/v1beta/models/{model}:generateContent?key={key}"
+            try:
+                response = requests.post(url=url, headers={"Content-Type": "application/json"}, 
+                    json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 4000}}, timeout=60)
+                data = response.json()
+                if "error" not in data and "candidates" in data:
+                    raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+                    break
+                if data.get("error", {}).get("code") == 429:
+                    break 
+            except Exception: continue
+        if raw_text: break
+
+    # Если Google не смог, идем в OpenRouter
+    if not raw_text and OPENROUTER_KEY:
+        try:
+            response = requests.post(
+                url="https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"},
+                json={"model": "openrouter/free", "messages": [{"role": "user", "content": prompt}], "max_tokens": 4000},
+                timeout=90
+            )
+            data = response.json()
+            if "error" not in data and "choices" in data:
+                raw_text = data["choices"][0]["message"]["content"]
+        except Exception: pass
+
+    if not raw_text: return None
+
+    # Очистка и сборка Word
+    raw_text = re.sub(r'[*#_`~]', '', raw_text)
+    raw_text = "".join(c for c in raw_text if c.isprintable() or c in '\n\r\t')
 
     try:
         doc = Document()
@@ -233,24 +273,12 @@ def create_gost_document(topic: str) -> io.BytesIO:
                 run.bold = True
             else:
                 p.add_run(text)
-            return p
 
-        title_p = doc.add_paragraph()
-        title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = title_p.add_run("РЕФЕРАТ")
-        run.bold = True
-        run.font.size = Pt(20)
-        doc.add_paragraph()
-        
-        topic_p = doc.add_paragraph()
-        topic_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = topic_p.add_run(f"на тему: «{topic}»")
-        run.bold = True
-        run.font.size = Pt(16)
+        doc.add_paragraph().add_run("РЕФЕРАТ").bold = True
+        doc.add_paragraph(f"на тему: «{topic}»")
         doc.add_paragraph("\n\n\n\n\n\n\n\n\n\n")
         
-        lines = raw_text.split('\n')
-        for line in lines:
+        for line in raw_text.split('\n'):
             line = line.strip()
             if not line: continue
             if len(line) < 60 and (line.isupper() or line.endswith(':')):
@@ -261,10 +289,9 @@ def create_gost_document(topic: str) -> io.BytesIO:
                 
         buf = io.BytesIO()
         doc.save(buf); buf.seek(0)
-        logger.info("Word-документ успешно собран!")
         return buf
     except Exception as e:
-        logger.error(f"Ошибка при сборке DOCX: {e}\n{traceback.format_exc()}")
+        logger.error(f"Ошибка сборки DOCX: {e}")
         return None
 
 # --- ОТПРАВКА ---
@@ -295,7 +322,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Я умею:\n"
         "💬 Отвечать на вопросы\n"
         "📊 <b>Создавать таблицы</b> (PNG)\n"
-        "📄 <b>Создавать .txt файлы</b>\n"
         "📝 <b>Писать рефераты по ГОСТу</b> (.docx)\n"
         "🧮 <b>Решать задачи по фото</b>\n\n"
         "Напиши: <i>«напиши реферат на тему [тема]»</i>"
@@ -321,7 +347,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["history"] = []
         await query.edit_message_text("🧹 Новый чат!", reply_markup=get_main_keyboard())
     elif query.data == "help":
-        text = "🤖 <b>Команды:</b>\n• /reset — сброс\n• «сделай таблицу»\n• «напиши реферат про...»\n• Пришли фото задачи."
+        text = "🤖 <b>Команды:</b>\n• /reset — сброс\n• «напиши реферат про...»\n• Пришли фото задачи."
         await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -340,22 +366,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if stop_event.is_set(): return
                 if docx_buffer:
                     await update.message.reply_document(
-                        document=docx_buffer, 
-                        filename=f"Referat_{topic[:10]}.docx", 
-                        caption=f"📝 Реферат по ГОСТу: <b>{topic}</b>", 
-                        parse_mode="HTML"
+                        document=docx_buffer, filename=f"Referat_{topic[:10]}.docx", 
+                        caption=f"📝 Реферат по ГОСТу: <b>{topic}</b>", parse_mode="HTML"
                     )
                 else: 
-                    await update.message.reply_text("⚠️ Не удалось создать реферат. Проверьте логи Render.")
+                    await update.message.reply_text("⚠️ Не удалось создать реферат. Лимиты исчерпаны.")
             finally:
                 stop_event.set(); await anim
-            return
-
-        if "создай файл" in user_text:
-            await update.message.chat.send_action(action="upload_document")
-            content = user_text.split("файл", 1)[1].replace(":", "").strip()
-            file_stream = io.BytesIO(content.encode('utf-8')); file_stream.name = "MogAI_File.txt"
-            await update.message.reply_document(document=file_stream, caption="📄 Файл готов!")
             return
 
         stop_event = asyncio.Event(); context.user_data["stop_event"] = stop_event
@@ -372,8 +389,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stop_event.set(); await anim
         await send_safe_message(update, ai_response)
     except Exception as e:
-        logger.error(f"КРИТИЧЕСКАЯ ОШИБКА В ЧАТЕ: {e}\n{traceback.format_exc()}")
-        try: await update.message.reply_text("⚠️ Произошла ошибка, но я жив.")
+        logger.error(f"ОШИБКА: {e}\n{traceback.format_exc()}")
+        try: await update.message.reply_text("⚠️ Ошибка, но бот жив.")
         except: pass
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -397,8 +414,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stop_event.set(); await anim
         await send_safe_message(update, ai_response)
     except Exception as e:
-        logger.error(f"КРИТИЧЕСКАЯ ОШИБКА В ФОТО: {e}\n{traceback.format_exc()}")
-        try: await update.message.reply_text("⚠️ Ошибка при обработке фото, но бот жив.")
+        logger.error(f"ОШИБКА ФОТО: {e}")
+        try: await update.message.reply_text("⚠️ Ошибка при обработке фото.")
         except: pass
 
 if __name__ == "__main__":
