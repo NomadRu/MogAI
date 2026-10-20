@@ -3,6 +3,7 @@ import base64
 import requests
 import logging
 import io
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, 
@@ -12,7 +13,6 @@ from telegram.ext import (
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- НАСТРОЙКИ ---
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 URL = os.environ.get("RENDER_EXTERNAL_URL")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
@@ -23,10 +23,7 @@ if not TOKEN or not GEMINI_KEY:
 
 GEMINI_TEXT_MODEL = "gemini-3.1-flash-lite"
 GEMINI_PROXY = "https://gemini-proxy.bold-violet-3c8d.workers.dev"
-
-# Модели OpenRouter
 OPENROUTER_VISION_MODEL = "qwen/qwen-2-vl-72b-instruct:free"
-# Автоматический роутер: сам выбирает доступную бесплатную модель для текста
 OPENROUTER_TEXT_MODEL = "openrouter/free"
 
 # --- КЛАВИАТУРЫ ---
@@ -45,6 +42,25 @@ def get_reset_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
+# --- АНИМАЦИЯ ОЖИДАНИЯ ---
+async def animate_thinking(update: Update, stop_event: asyncio.Event):
+    """Имитация анимации: редактирует сообщение каждые 2 секунды"""
+    msg = await update.message.reply_text("⏳ <b>MogAI думает...</b>", parse_mode="HTML")
+    seconds = 0
+    while not stop_event.is_set():
+        await asyncio.sleep(2)
+        seconds += 2
+        if stop_event.is_set():
+            break
+        try:
+            await msg.edit_text(f"⏳ <b>MogAI думает...</b> ({seconds} сек)", parse_mode="HTML")
+        except Exception:
+            pass
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
 # --- ЗАПРОСЫ К OPENROUTER ---
 def ask_openrouter_text(messages: list) -> str:
     if not OPENROUTER_KEY:
@@ -58,7 +74,7 @@ def ask_openrouter_text(messages: list) -> str:
         response = requests.post(
             url="https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"},
-            json={"model": OPENROUTER_TEXT_MODEL, "messages": or_messages, "max_tokens": 600},
+            json={"model": OPENROUTER_TEXT_MODEL, "messages": or_messages, "max_tokens": 3000},
             timeout=30
         )
         data = response.json()
@@ -88,7 +104,7 @@ def ask_openrouter_vision(image_b64: str, user_text: str, history: list) -> str:
         response = requests.post(
             url="https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"},
-            json={"model": OPENROUTER_VISION_MODEL, "messages": messages, "max_tokens": 800},
+            json={"model": OPENROUTER_VISION_MODEL, "messages": messages, "max_tokens": 3000},
             timeout=60
         )
         data = response.json()
@@ -98,11 +114,16 @@ def ask_openrouter_vision(image_b64: str, user_text: str, history: list) -> str:
     except Exception as e:
         return f"⚠️ Сбой Vision: {str(e)}"
 
-# --- УМНЫЙ ЗАПРОС ДЛЯ ТЕКСТА (GEMINI -> OPENROUTER) ---
+# --- УМНЫЙ ЗАПРОС ДЛЯ ТЕКСТА ---
 def ask_text_smart(messages: list) -> str:
-    # 1. Пробуем Gemini
     contents = []
-    system_instruction = "Ты — MogAI. Отвечай кратко. Используй HTML-теги (<b>жирный</b>)."
+    system_instruction = (
+        "Ты — MogAI, умный помощник.\n"
+        "ВАЖНО: Если ты пишешь код, обязательно используй блоки кода Markdown:\n"
+        "```python\nprint('Hello')\n```\n"
+        "Для обычного текста используй HTML-теги: <b>жирный</b>, <i>курсив</i>.\n"
+        "Если нужно создать таблицу, используй Markdown (| и -)."
+    )
     contents.append({"role": "user", "parts": [{"text": system_instruction}]})
     
     for msg in messages:
@@ -113,14 +134,14 @@ def ask_text_smart(messages: list) -> str:
     
     try:
         response = requests.post(url=url, headers={"Content-Type": "application/json"}, 
-            json={"contents": contents, "generationConfig": {"maxOutputTokens": 600}}, timeout=25)
+            json={"contents": contents, "generationConfig": {"maxOutputTokens": 3000}}, timeout=25)
         data = response.json()
         
         if "error" not in data and "candidates" in data:
             return data["candidates"][0]["content"]["parts"][0]["text"]
             
         if data.get("error", {}).get("code") == 503:
-            logger.warning("Gemini перегружен (503). Переключаемся на OpenRouter.")
+            logger.warning("Gemini перегружен. Переключаемся на OpenRouter.")
             return ask_openrouter_text(messages)
             
         return f"⚠️ Ошибка Gemini: {data.get('error', {}).get('message')}"
@@ -133,12 +154,14 @@ def ask_text_smart(messages: list) -> str:
 async def send_safe_message(update: Update, text: str):
     if len(text) > 3500:
         file_stream = io.BytesIO(text.encode('utf-8'))
-        file_stream.name = "Reshenie.txt"
-        await update.message.reply_document(document=file_stream, caption="📄 Ответ в файле.")
+        file_stream.name = "MogAI_Otvet.txt"
+        await update.message.reply_document(document=file_stream, caption="📄 Ответ слишком длинный. Сохранил в файл!")
         return
+
     try:
         await update.message.reply_text(text, parse_mode="HTML")
-    except Exception:
+    except Exception as e:
+        logger.warning(f"HTML сломался: {e}. Отправляем как обычный текст.")
         await update.message.reply_text(text)
 
 # --- КОМАНДЫ ---
@@ -198,27 +221,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(document=file_stream, caption="📄 Файл готов!")
         return
 
-    await update.message.chat.send_action(action="typing")
-    
-    history = context.user_data.get("history", [])
-    history.append({"role": "user", "content": user_text})
-    if len(history) > 8: history = history[-8:]
-    
-    # Умный запрос
-    ai_response = ask_text_smart(history)
-    
-    history.append({"role": "assistant", "content": ai_response})
-    context.user_data["history"] = history
+    # Запускаем анимацию
+    stop_event = asyncio.Event()
+    animation_task = asyncio.create_task(animate_thinking(update, stop_event))
+
+    try:
+        history = context.user_data.get("history", [])
+        history.append({"role": "user", "content": user_text})
+        if len(history) > 8: history = history[-8:]
+        
+        # Запрос к ИИ в отдельном потоке, чтобы не блокировать анимацию
+        ai_response = await asyncio.to_thread(ask_text_smart, history)
+        
+        history.append({"role": "assistant", "content": ai_response})
+        context.user_data["history"] = history
+    finally:
+        # Останавливаем анимацию
+        stop_event.set()
+        await animation_task
+
     await send_safe_message(update, ai_response)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.chat.send_action(action="typing")
-    
+    # Запускаем анимацию
+    stop_event = asyncio.Event()
+    animation_task = asyncio.create_task(animate_thinking(update, stop_event))
+
     try:
         photo_file = await update.message.photo[-1].get_file()
         file_bytes = await photo_file.download_as_bytearray()
         
         if len(file_bytes) > 4 * 1024 * 1024:
+            stop_event.set()
+            await animation_task
             await update.message.reply_text("⚠️ Фото больше 4 МБ.")
             return
 
@@ -226,16 +261,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption = update.message.caption or "Что на фото? Реши задачу."
         
         history = context.user_data.get("history", [])
-        ai_response = ask_openrouter_vision(image_b64, caption, history)
+        
+        # Запрос к ИИ в отдельном потоке
+        ai_response = await asyncio.to_thread(ask_openrouter_vision, image_b64, caption, history)
         
         history.append({"role": "user", "content": f"[Фото] {caption}"})
         history.append({"role": "assistant", "content": ai_response})
         context.user_data["history"] = history[-8:]
-        
-        await send_safe_message(update, ai_response)
-    except Exception as e:
-        logger.error(f"Ошибка фото: {e}")
-        await update.message.reply_text("⚠️ Не удалось скачать фото.")
+    finally:
+        stop_event.set()
+        await animation_task
+
+    await send_safe_message(update, ai_response)
 
 # --- ЗАПУСК (WEBHOOK) ---
 if __name__ == "__main__":
@@ -255,4 +292,4 @@ if __name__ == "__main__":
         url_path=TOKEN,
         webhook_url=f"{URL}/{TOKEN}",
         drop_pending_updates=True
-        )
+    )
