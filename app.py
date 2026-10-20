@@ -15,13 +15,15 @@ logger = logging.getLogger(__name__)
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 URL = os.environ.get("RENDER_EXTERNAL_URL")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
+OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
 
 if not TOKEN or not GEMINI_KEY:
     raise ValueError("Не заданы TELEGRAM_TOKEN или GEMINI_API_KEY!")
 
+# Модели
 GEMINI_TEXT_MODELS = ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
-# Используем самую надежную модель для фото
-GEMINI_VISION_MODELS = ["gemini-3.5-flash", "gemini-3.8-flash"]
+# Бесплатная модель в OpenRouter, которая отлично видит картинки
+OPENROUTER_VISION_MODEL = "meta-llama/llama-3.2-11b-vision-instruct:free"
 
 # --- КЛАВИАТУРЫ ---
 def get_main_keyboard():
@@ -39,8 +41,8 @@ def get_reset_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# --- ЗАПРОСЫ К GEMINI ---
-def ask_ai(messages: list) -> str:
+# --- ТЕКСТ (GEMINI) ---
+def ask_gemini_text(messages: list) -> str:
     contents = []
     system_instruction = "Ты — MogAI. Отвечай текстом. Используй HTML-теги (<b>жирный</b>)."
     contents.append({"role": "user", "parts": [{"text": system_instruction}]})
@@ -61,51 +63,51 @@ def ask_ai(messages: list) -> str:
                 return data["candidates"][0]["content"]["parts"][0]["text"]
         except Exception:
             continue
-    return "⚠️ Все модели перегружены. Попробуйте позже."
+    return "⚠️ Текстовые модели перегружены. Попробуйте позже."
 
-def ask_ai_with_image(image_b64: str, user_text: str) -> str:
-    vision_instruction = (
-        f"{user_text}\n\n"
-        "Опиши, что ты видишь на фото. Если это задача, реши её."
-    )
+# --- ФОТО (OPENROUTER) ---
+def ask_openrouter_vision(image_b64: str, user_text: str, history: list) -> str:
+    if not OPENROUTER_KEY:
+        return "⚠️ Для чтения фото нужен OPENROUTER_API_KEY в настройках Render."
 
-    for model in GEMINI_VISION_MODELS:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
-        try:
-            response = requests.post(
-                url=url, 
-                headers={"Content-Type": "application/json"},
-                json={
-                    "contents": [{
-                        "parts": [
-                            {"text": vision_instruction}, 
-                            # ПРИНУДИТЕЛЬНО ставим image/jpeg
-                            {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}}
-                        ]
-                    }]
-                },
-                timeout=90 
-            )
-            data = response.json()
+    # Формируем сообщение с картинкой
+    messages = []
+    
+    # Добавляем историю (только текст, чтобы не забивать лимиты)
+    for msg in history[-6:]: # берем последние 6 сообщений для контекста
+        messages.append({"role": msg["role"], "content": msg["content"]})
+        
+    # Добавляем текущий запрос с картинкой
+    messages.append({
+        "role": "user",
+        "content": [
+            {"type": "text", "text": user_text or "Что на фото? Опиши или реши задачу."},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
+        ]
+    })
+
+    try:
+        response = requests.post(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": OPENROUTER_VISION_MODEL,
+                "messages": messages,
+                "max_tokens": 1500
+            },
+            timeout=60
+        )
+        data = response.json()
+        
+        if "error" in data:
+            return f"⚠️ Ошибка OpenRouter: {data['error'].get('message')}"
             
-            # ВЫВОДИМ ОШИБКУ В ЧАТ, ЧТОБЫ МЫ УВИДЕЛИ ПРИЧИНУ
-            if "error" in data:
-                err_msg = data['error'].get('message', 'Неизвестная ошибка')
-                logger.error(f"Ошибка {model}: {err_msg}")
-                if data["error"].get("code") in (503, 429, 500): continue
-                return f"⚠️ <b>Ошибка от Google:</b>\n<code>{err_msg}</code>"
-                
-            if "candidates" in data:
-                return data["candidates"][0]["content"]["parts"][0]["text"]
-                
-        except requests.exceptions.Timeout:
-            logger.error(f"Таймаут на модели {model}.")
-            continue
-        except Exception as e:
-            logger.error(f"Сбой на модели {model}: {e}")
-            continue
-            
-    return "⚠️ Не удалось обработать фото. Проверьте логи Render."
+        return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"⚠️ Сбой сети при чтении фото: {str(e)}"
 
 # --- УМНАЯ ОТПРАВКА ---
 async def send_safe_message(update: Update, text: str):
@@ -127,10 +129,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
         "👋 <b>Привет! Я MogAI.</b>\n\n"
         "Я умею:\n"
-        "💬 Отвечать на вопросы\n"
+        "💬 Отвечать на вопросы (Gemini)\n"
         "📊 <b>Создавать таблицы</b>\n"
         "📄 <b>Создавать .txt файлы</b>\n"
-        "🧮 <b>Решать задачи по фото</b>\n\n"
+        "🧮 <b>Решать задачи по фото</b> (OpenRouter Vision)\n\n"
         "<b>Задай вопрос или используй кнопки!</b>"
     )
     await update.message.reply_text(welcome_text, reply_markup=get_main_keyboard(), parse_mode="HTML")
@@ -184,7 +186,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(history) > 12: history = history[-12:]
     
     await update.message.chat.send_action(action="typing")
-    ai_response = ask_ai(history)
+    
+    # ТУТ ВЫЗЫВАЕМ GEMINI ДЛЯ ТЕКСТА
+    ai_response = ask_gemini_text(history)
+    
     history.append({"role": "assistant", "content": ai_response})
     context.user_data["history"] = history
     
@@ -194,24 +199,32 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action(action="upload_photo")
     
     try:
-        # Берем фото и проверяем его
         photo_file = await update.message.photo[-1].get_file()
         file_bytes = await photo_file.download_as_bytearray()
         
-        # Если фото весит больше 4 МБ, Google его не примет
         if len(file_bytes) > 4 * 1024 * 1024:
-            await update.message.reply_text("⚠️ Фото слишком большое (больше 4 МБ). Отправьте фото меньшего размера или сожмите его.")
+            await update.message.reply_text("⚠️ Фото слишком большое (больше 4 МБ).")
             return
 
         image_b64 = base64.b64encode(file_bytes).decode("utf-8")
         caption = update.message.caption or "Что на фото? Опиши или реши."
         
-        ai_response = ask_ai_with_image(image_b64, caption)
+        history = context.user_data.get("history", [])
+        
+        # ТУТ ВЫЗЫВАЕМ OPENROUTER ДЛЯ ФОТО
+        ai_response = ask_openrouter_vision(image_b64, caption, history)
+        
+        # Сохраняем в общую историю
+        history.append({"role": "user", "content": f"[Пользователь отправил фото] {caption}"})
+        history.append({"role": "assistant", "content": ai_response})
+        if len(history) > 12: history = history[-12:]
+        context.user_data["history"] = history
+        
         await send_safe_message(update, ai_response)
         
     except Exception as e:
         logger.error(f"Критическая ошибка при скачивании фото: {e}")
-        await update.message.reply_text("⚠️ Не удалось скачать фото из Telegram. Попробуйте еще раз.")
+        await update.message.reply_text("⚠️ Не удалось скачать фото из Telegram.")
 
 # --- ЗАПУСК ---
 if __name__ == "__main__":
