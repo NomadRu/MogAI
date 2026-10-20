@@ -154,7 +154,7 @@ def ask_groq_text(messages: list) -> str:
             response = requests.post(
                 url=GROQ_API_URL,
                 headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-                json={"model": model, "messages": or_messages, "max_tokens": 3000},
+                json={"model": model, "messages": or_messages, "max_tokens": 4000},
                 timeout=40
             )
             data = response.json()
@@ -167,12 +167,13 @@ def ask_groq_text(messages: list) -> str:
 def ask_mistral_vision(image_b64: str, user_text: str) -> str:
     if not MISTRAL_KEY: return "⚠️ Для фото нужен MISTRAL_API_KEY."
 
-    # Просим модель определить, есть ли задача на фото
     prompt = (
-        f"Внимательно посмотри на фото. Пользователь спрашивает: '{user_text or 'реши задачи'}'.\n"
-        "1. Если на фото есть математическая задача (уравнения, матрицы, примеры), реши её пошагово. "
-        "ОБЯЗАТЕЛЬНО используй LaTeX для формул: пиши математику в формате \\( x^2 \\) или \\[ x^2 \\]. "
-        "2. Если на фото НЕТ задачи (мем, природа, человек), просто опиши, что на фото, в 2-3 предложениях. Начни ответ со слова 'ОПИСАНИЕ:'.\n"
+        f"Пользователь прислал фото. Вопрос: '{user_text or 'реши задачи'}'.\n\n"
+        "Если на фото есть математическая задача (уравнения, матрицы, примеры), реши ВСЕ задачи на фото, без исключений. "
+        "Не пиши фразы вроде 'для остальных примеров...'. Доводи каждое решение до конца. "
+        "ОБЯЗАТЕЛЬНО используй LaTeX для формул: пиши математику строго внутри \\( ... \\) для строчных или \\[ ... \\] для блочных. "
+        "НЕ используй HTML-теги <br> внутри формул LaTeX.\n\n"
+        "Если на фото НЕТ задачи, просто опиши, что на фото, в 2-3 предложениях. Начни ответ со слова 'ОПИСАНИЕ:'."
     )
 
     messages = [
@@ -372,27 +373,34 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"📸 {clean_desc}")
                 return
 
-            # Иначе — это задача. Создаем HTML с MathJax для формул
-            safe_response = ai_response.replace('\n', '<br>')
+            # Очищаем от HTML-тегов внутри формул, чтобы MathJax их понял
+            # Заменяем <br> на обычный перенос строки
+            clean_ai_response = ai_response.replace('<br>', '\n')
+            
+            # Формируем HTML
             html_content = f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
     <title>Решение задачи от MogAI</title>
-    <!-- Подключаем MathJax для красивых формул -->
-    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
-    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script>
+        MathJax = {{
+            tex: {{ inlineMath: [['$', '$'], ['\\(', '\\)']] }},
+            svg: {{ fontCache: 'global' }}
+        }};
+    </script>
+    <script type="text/javascript" id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
     <style>
         body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; padding: 20px; max-width: 900px; margin: 0 auto; background-color: #f4f4f9; color: #333; }}
         h1 {{ color: #2c3e50; text-align: center; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
-        .solution {{ background: white; padding: 25px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); font-size: 18px; line-height: 1.8; }}
+        .solution {{ background: white; padding: 25px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); font-size: 18px; line-height: 1.8; white-space: pre-wrap; }}
         .footer {{ text-align: center; margin-top: 20px; font-size: 12px; color: #7f8c8d; }}
     </style>
 </head>
 <body>
     <h1>📝 Решение задачи</h1>
     <div class="solution">
-        {safe_response}
+{clean_ai_response}
     </div>
     <div class="footer">Сгенерировано MogAI</div>
 </body>
