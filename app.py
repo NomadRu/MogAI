@@ -25,10 +25,12 @@ OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
 if not TOKEN or not GEMINI_KEY:
     raise ValueError("Не заданы TELEGRAM_TOKEN или GEMINI_API_KEY!")
 
-# Модели
-GEMINI_TEXT_MODELS = ["gemini-3.5-flash", "gemini-3.1-flash-lite"] # Сначала мощная, потом быстрая
+# Модели Gemini (сначала быстрые и стабильные, потом мощные)
+GEMINI_TEXT_MODELS = ["gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash"]
 GEMINI_VISION_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash"]
 GEMINI_PROXY = "https://gemini-proxy.bold-violet-3c8d.workers.dev"
+
+# OpenRouter оставляем только как глубокий резерв (если Gemini вообще лег)
 OPENROUTER_TEXT_MODEL = "openrouter/free"
 OPENROUTER_VISION_MODELS = ["nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", "google/gemma-4-31b-it:free"]
 
@@ -53,86 +55,62 @@ def get_stop_keyboard():
 def markdown_to_png(text: str) -> io.BytesIO:
     lines = text.split('\n')
     table_data = []
-    
     for line in lines:
         clean_line = line.strip()
         if "|" in clean_line and not clean_line.startswith('```'):
-            # Убираем лишние пробелы и разбиваем
             parts = [part.strip() for part in clean_line.strip('|').split('|')]
-            # Пропускаем разделители
             if all(re.match(r'^:?-+:?$', p) for p in parts if p):
                 continue
-            # Если строка не пустая, добавляем
             if any(p for p in parts):
                 table_data.append(parts)
-    
-    # Если меньше 2 строк или нет заголовка — не рисуем
     if len(table_data) < 2:
         return None
-
-    # Выравниваем количество колонок
     max_cols = max(len(row) for row in table_data)
     for row in table_data:
         while len(row) < max_cols:
             row.append("")
-
     fig, ax = plt.subplots(figsize=(10, max(2, len(table_data) * 0.5)))
     ax.axis('tight')
     ax.axis('off')
-    
     table = ax.table(cellText=table_data[1:], colLabels=table_data[0], cellLoc='center', loc='center')
     table.auto_set_font_size(False)
     table.set_fontsize(10)
     table.scale(1.2, 1.5)
-    
     for (row, col), cell in table.get_celld().items():
         if row == 0:
             cell.set_text_props(weight='bold', color='white')
             cell.set_facecolor('#4a4a4a')
         else:
             cell.set_facecolor('#f0f0f0' if row % 2 == 0 else 'white')
-
     buf = io.BytesIO()
     plt.savefig(buf, format='png', bbox_inches='tight', dpi=200)
     buf.seek(0)
     plt.close(fig)
     return buf
 
-# --- НАДЕЖНЫЙ ЧИСТИЛЬЩИК ТЕКСТА ---
+# --- ЧИСТИЛЬЩИК ТЕКСТА ---
 def format_text_for_telegram(text: str) -> str:
-    # 1. Прячем код (ловит и ```python, и просто ```)
     code_blocks = []
     def save_code(match):
         code = match.group(2).strip()
         lang = match.group(1).strip() if match.group(1) else ""
         code_blocks.append((lang, code))
         return f"%%%CODE_{len(code_blocks)-1}%%%"
-    
     text = re.sub(r'```([a-zA-Z0-9]*)\n?([\s\S]*?)```', save_code, text)
-    
-    # 2. Убираем таблицы из текста (они уйдут в PNG)
     text = re.sub(r'^\|.*\|$', '', text, flags=re.MULTILINE)
-    
-    # 3. Форматируем Markdown в HTML
     text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
     text = re.sub(r'__(.*?)__', r'<b>\1</b>', text)
     text = re.sub(r'\*(.*?)\*', r'<i>\1</i>', text)
     text = re.sub(r'_(.*?)_', r'<i>\1</i>', text)
     text = re.sub(r'^#{1,6}\s+(.*)$', r'<b>\1</b>', text, flags=re.MULTILINE)
-    
-    # 4. Экранируем HTML
     text = text.replace('&', '&amp;').replace('>', '&gt;').replace('<', '&lt;')
     for tag in ['b', 'i', 's', 'code', 'pre']:
         text = text.replace(f'&lt;{tag}&gt;', f'<{tag}>').replace(f'&lt;/{tag}&gt;', f'</{tag}>')
-    
-    # 5. Возвращаем код на место
     for i, (lang, code) in enumerate(code_blocks):
         safe_code = code.replace('&', '&amp;').replace('>', '&gt;').replace('<', '&lt;')
-        # Если язык не указан, не пишем class
         lang_class = f' class="language-{lang}"' if lang else ''
         html_code = f"<pre><code{lang_class}>{safe_code}</code></pre>"
         text = text.replace(f"%%%CODE_{i}%%%", html_code)
-        
     return text.strip()
 
 # --- АНИМАЦИЯ ---
@@ -155,10 +133,9 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: await query.edit_message_text("⏹ <b>Запрос отменён.</b>", parse_mode="HTML")
     except Exception: pass
 
-# --- ЗАПРОСЫ ---
+# --- ЗАПРОСЫ (ТЕКСТ) ---
 def ask_gemini_text(messages: list) -> str:
     contents = []
-    # Умный системный промпт
     system_instruction = (
         "Ты — MogAI, умный и полезный ИИ-ассистент. Отвечай подробно и по делу. "
         "Если пользователь просит таблицу, ВСЕГДА используй формат Markdown: | Столбец1 | Столбец2 |\n|---|---|\n| Данные | Данные |. "
@@ -170,19 +147,34 @@ def ask_gemini_text(messages: list) -> str:
         role = "user" if msg["role"] == "user" else "model"
         contents.append({"role": role, "parts": [{"text": msg["content"]}]})
 
+    # Перебираем ТОЛЬКО модели Gemini
     for model in GEMINI_TEXT_MODELS:
         url = f"{GEMINI_PROXY}/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
         try:
             response = requests.post(url=url, headers={"Content-Type": "application/json"}, 
                 json={"contents": contents, "generationConfig": {"maxOutputTokens": 3000}}, timeout=25)
             data = response.json()
+            
             if "error" not in data and "candidates" in data:
                 return data["candidates"][0]["content"]["parts"][0]["text"]
-            if data.get("error", {}).get("code") in (503, 429): continue
+            
+            # Если перегрузка или лимит — пробуем следующую модель Gemini
+            if data.get("error", {}).get("code") in (503, 429): 
+                logger.warning(f"Модель {model} перегружена. Пробуем следующую...")
+                continue
+            
+            # Если другая ошибка (например, неверный запрос) — возвращаем её
             return f"⚠️ Ошибка Gemini: {data.get('error', {}).get('message')}"
-        except Exception: continue
+            
+        except Exception as e: 
+            logger.error(f"Сбой на {model}: {e}")
+            continue
+            
+    # Если ВСЕ модели Gemini легли, идем в OpenRouter (последний шанс)
+    logger.warning("Все модели Gemini недоступны. Переключаюсь на OpenRouter.")
     return ask_openrouter_text(messages)
 
+# --- ЗАПРОСЫ (ФОТО) ---
 def ask_gemini_vision(image_b64: str, user_text: str) -> str:
     for model in GEMINI_VISION_MODELS:
         url = f"{GEMINI_PROXY}/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
@@ -192,13 +184,18 @@ def ask_gemini_vision(image_b64: str, user_text: str) -> str:
             data = response.json()
             if "error" not in data and "candidates" in data:
                 return data["candidates"][0]["content"]["parts"][0]["text"]
-            if data.get("error", {}).get("code") in (503, 429): continue
+            if data.get("error", {}).get("code") in (503, 429): 
+                logger.warning(f"Vision {model} перегружен. Пробуем следующую...")
+                continue
             return f"⚠️ Ошибка Gemini (фото): {data.get('error', {}).get('message')}"
         except Exception: continue
+    
+    logger.warning("Все модели Gemini Vision недоступны. Резерв OpenRouter.")
     return ask_openrouter_vision(image_b64, user_text, [])
 
+# --- РЕЗЕРВ (OPENROUTER) ---
 def ask_openrouter_text(messages: list) -> str:
-    if not OPENROUTER_KEY: return "⚠️ Нужен OPENROUTER_API_KEY."
+    if not OPENROUTER_KEY: return "⚠️ Все модели Gemini перегружены, а ключа OpenRouter нет."
     or_messages = [{"role": "system", "content": "Ты — MogAI. Отвечай текстом."}]
     for msg in messages[-6:]: or_messages.append({"role": msg["role"], "content": msg["content"]})
     try:
@@ -206,12 +203,12 @@ def ask_openrouter_text(messages: list) -> str:
             headers={"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"},
             json={"model": OPENROUTER_TEXT_MODEL, "messages": or_messages, "max_tokens": 3000}, timeout=30)
         data = response.json()
-        if "error" in data: return f"⚠️ OpenRouter: {data['error'].get('message')}"
+        if "error" in data: return f"⚠️ Ошибка OpenRouter (резерв): {data['error'].get('message')}"
         return data["choices"][0]["message"]["content"]
-    except Exception as e: return f"⚠️ Сбой: {e}"
+    except Exception as e: return f"⚠️ Сбой резерва: {e}"
 
 def ask_openrouter_vision(image_b64: str, user_text: str, history: list) -> str:
-    if not OPENROUTER_KEY: return "⚠️ Нужен OPENROUTER_API_KEY."
+    if not OPENROUTER_KEY: return "⚠️ Все модели Gemini Vision перегружены, а ключа OpenRouter нет."
     messages = [{"role": "user", "content": [{"type": "text", "text": user_text or "Что на фото?"}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}]}]
     last_err = "Нет доступных моделей"
     for model in OPENROUTER_VISION_MODELS:
@@ -223,26 +220,22 @@ def ask_openrouter_vision(image_b64: str, user_text: str, history: list) -> str:
             if "error" in data: last_err = data["error"].get("message"); continue
             return data["choices"][0]["message"]["content"]
         except Exception as e: last_err = str(e); continue
-    return f"⚠️ Ошибка обработки фото. {last_err}"
+    return f"⚠️ Ошибка обработки фото (резерв). {last_err}"
 
 # --- ОТПРАВКА ---
 async def send_safe_message(update: Update, text: str):
-    # 1. Пробуем нарисовать таблицу
     png_buffer = markdown_to_png(text)
     if png_buffer:
         await update.message.reply_photo(photo=png_buffer, caption="📊 Вот твоя таблица!")
-        # Удаляем таблицу из текста, чтобы не дублировать
         text = re.sub(r'^\|.*\|$', '', text, flags=re.MULTILINE).strip()
         if not text: return
 
-    # 2. Если текст огромный
     if len(text) > 3500:
         file_stream = io.BytesIO(text.encode('utf-8'))
         file_stream.name = "MogAI_Otvet.txt"
         await update.message.reply_document(document=file_stream, caption="📄 Длинный ответ в файле.")
         return
 
-    # 3. Отправляем остаток текста с красивым кодом
     formatted_text = format_text_for_telegram(text)
     if not formatted_text.strip(): return
 
@@ -306,7 +299,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         history = context.user_data.get("history", [])
         history.append({"role": "user", "content": user_text})
         if len(history) > 8: history = history[-8:]
+        
+        # Вызов Gemini (с внутренним перебором моделей)
         ai_response = await asyncio.to_thread(ask_gemini_text, history)
+        
         if stop_event.is_set(): return
         history.append({"role": "assistant", "content": ai_response})
         context.user_data["history"] = history
@@ -332,7 +328,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image_b64 = base64.b64encode(file_bytes).decode("utf-8")
         caption = update.message.caption or "Что на фото? Реши задачу."
         history = context.user_data.get("history", [])
+        
+        # Вызов Gemini Vision
         ai_response = await asyncio.to_thread(ask_gemini_vision, image_b64, caption)
+        
         if stop_event.is_set(): return
         history.append({"role": "user", "content": f"[Фото] {caption}"})
         history.append({"role": "assistant", "content": ai_response})
