@@ -31,15 +31,13 @@ logger = logging.getLogger(__name__)
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 URL = os.environ.get("RENDER_EXTERNAL_URL")
 GROQ_KEY = os.environ.get("GROQ_API_KEY")
-MISTRAL_KEY = os.environ.get("MISTRAL_API_KEY") # Ключ для фото
+MISTRAL_KEY = os.environ.get("MISTRAL_API_KEY")
 
 if not TOKEN or not GROQ_KEY:
     raise ValueError("Не заданы TELEGRAM_TOKEN или GROQ_API_KEY!")
 
-# --- МОДЕЛИ ---
 GROQ_TEXT_MODELS = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "openai/gpt-oss-20b"]
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-
 MISTRAL_VISION_MODEL = "pixtral-12b-2409"
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 
@@ -66,7 +64,6 @@ def markdown_to_png(text: str) -> io.BytesIO:
     try:
         clean_text = re.sub(r'```[a-zA-Z]*\n?', '', text)
         clean_text = re.sub(r'```', '', clean_text)
-        
         lines = clean_text.split('\n')
         table_data = []
         for line in lines:
@@ -77,7 +74,6 @@ def markdown_to_png(text: str) -> io.BytesIO:
                 if any(p for p in parts): table_data.append(parts)
                 
         if len(table_data) < 2: return None
-        
         for row in table_data:
             for i in range(len(row)):
                 row[i] = row[i].replace('**', '').replace('*', '')
@@ -88,26 +84,20 @@ def markdown_to_png(text: str) -> io.BytesIO:
             
         fig, ax = plt.subplots(figsize=(14, max(2, len(table_data) * 0.8)))
         ax.axis('tight'); ax.axis('off')
-        
         table = ax.table(cellText=table_data[1:], colLabels=table_data[0], cellLoc='left', loc='center')
-        table.auto_set_font_size(False)
-        table.set_fontsize(8)
-        table.scale(1, 2.5)
+        table.auto_set_font_size(False); table.set_fontsize(8); table.scale(1, 2.5)
         
         for (row, col), cell in table.get_celld().items():
             cell.set_text_props(wrap=True)
             if row == 0:
                 cell.set_text_props(weight='bold', color='white'); cell.set_facecolor('#4a4a4a')
-            else: 
-                cell.set_facecolor('#f0f0f0' if row % 2 == 0 else 'white')
+            else: cell.set_facecolor('#f0f0f0' if row % 2 == 0 else 'white')
                 
         buf = io.BytesIO()
         plt.savefig(buf, format='png', bbox_inches='tight', dpi=200)
         buf.seek(0); plt.close(fig)
         return buf
-    except Exception as e:
-        logger.error(f"Ошибка отрисовки: {e}")
-        return None
+    except Exception: return None
 
 # --- ЧИСТИЛЬЩИК ТЕКСТА ---
 def format_text_for_telegram(text: str) -> str:
@@ -155,7 +145,7 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- ЗАПРОСЫ К GROQ (ТЕКСТ) ---
 def ask_groq_text(messages: list) -> str:
-    or_messages = [{"role": "system", "content": "Ты — MogAI. Отвечай текстом. Если просят таблицу, пиши её ТОЛЬКО в формате Markdown (| и -). НЕ используй ``` для таблиц."}]
+    or_messages = [{"role": "system", "content": "Ты — MogAI. Отвечай текстом. Если просят таблицу, пиши её ТОЛЬКО в формате Markdown (| и -)."}]
     for msg in messages[-8:]:
         or_messages.append({"role": msg["role"], "content": msg["content"]})
 
@@ -175,14 +165,21 @@ def ask_groq_text(messages: list) -> str:
 
 # --- ЗАПРОСЫ К MISTRAL (ФОТО) ---
 def ask_mistral_vision(image_b64: str, user_text: str) -> str:
-    if not MISTRAL_KEY: 
-        return "⚠️ Для фото нужен MISTRAL_API_KEY."
+    if not MISTRAL_KEY: return "⚠️ Для фото нужен MISTRAL_API_KEY."
+
+    # Просим модель определить, есть ли задача на фото
+    prompt = (
+        f"Внимательно посмотри на фото. Пользователь спрашивает: '{user_text or 'реши задачи'}'.\n"
+        "1. Если на фото есть математическая задача (уравнения, матрицы, примеры), реши её пошагово. "
+        "ОБЯЗАТЕЛЬНО используй LaTeX для формул: пиши математику в формате \\( x^2 \\) или \\[ x^2 \\]. "
+        "2. Если на фото НЕТ задачи (мем, природа, человек), просто опиши, что на фото, в 2-3 предложениях. Начни ответ со слова 'ОПИСАНИЕ:'.\n"
+    )
 
     messages = [
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": user_text or "Реши задачи на фото. Распиши пошагово."},
+                {"type": "text", "text": prompt},
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
             ]
         }
@@ -196,13 +193,9 @@ def ask_mistral_vision(image_b64: str, user_text: str) -> str:
             timeout=60
         )
         data = response.json()
-        
-        if "error" in data:
-            return f"⚠️ Ошибка Mistral (фото): {data['error'].get('message')}"
-            
+        if "error" in data: return f"⚠️ Ошибка Mistral (фото): {data['error'].get('message')}"
         return data["choices"][0]["message"]["content"]
-    except Exception as e:
-        return f"⚠️ Сбой Mistral (фото): {e}"
+    except Exception as e: return f"⚠️ Сбой Mistral (фото): {e}"
 
 # --- СОЗДАНИЕ РЕФЕРАТА ---
 def create_gost_document(topic: str) -> io.BytesIO:
@@ -365,7 +358,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             image_b64 = base64.b64encode(file_bytes).decode("utf-8")
             caption = update.message.caption or "Реши задачи на фото."
             
-            # Идем в Mistral
             ai_response = await asyncio.to_thread(ask_mistral_vision, image_b64, caption)
             
             if stop_event.is_set(): return
@@ -374,29 +366,41 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(ai_response)
                 return
 
+            # Если это просто описание фото (мем, кот и т.д.)
+            if ai_response.startswith("ОПИСАНИЕ:"):
+                clean_desc = ai_response.replace("ОПИСАНИЕ:", "").strip()
+                await update.message.reply_text(f"📸 {clean_desc}")
+                return
+
+            # Иначе — это задача. Создаем HTML с MathJax для формул
             safe_response = ai_response.replace('\n', '<br>')
             html_content = f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
     <title>Решение задачи от MogAI</title>
+    <!-- Подключаем MathJax для красивых формул -->
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <style>
-        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; padding: 20px; max-width: 800px; margin: 0 auto; background-color: #f4f4f9; color: #333; }}
+        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; padding: 20px; max-width: 900px; margin: 0 auto; background-color: #f4f4f9; color: #333; }}
         h1 {{ color: #2c3e50; text-align: center; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
-        .solution {{ background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); white-space: pre-wrap; font-size: 16px; }}
+        .solution {{ background: white; padding: 25px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); font-size: 18px; line-height: 1.8; }}
         .footer {{ text-align: center; margin-top: 20px; font-size: 12px; color: #7f8c8d; }}
     </style>
 </head>
 <body>
     <h1>📝 Решение задачи</h1>
-    <div class="solution">{safe_response}</div>
+    <div class="solution">
+        {safe_response}
+    </div>
     <div class="footer">Сгенерировано MogAI</div>
 </body>
 </html>"""
             
             file_stream = io.BytesIO(html_content.encode('utf-8'))
             file_stream.name = "Reshenie.html"
-            await update.message.reply_document(document=file_stream, caption="📄 Вот HTML-файл с решением задачи!")
+            await update.message.reply_document(document=file_stream, caption="📄 Вот HTML-файл с решением задачи! Открой его в браузере, чтобы увидеть красивые формулы.")
             
             history = context.user_data.get("history", [])
             history.append({"role": "user", "content": f"[Фото задачи] {caption}"})
