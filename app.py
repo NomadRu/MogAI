@@ -248,7 +248,6 @@ def create_gost_document(topic: str) -> io.BytesIO:
 # --- ОТПРАВКА ---
 async def send_safe_message(update: Update, text: str):
     try:
-        # Пытаемся нарисовать таблицу (если она есть)
         if "|" in text:
             png_buffer = markdown_to_png(text)
             if png_buffer:
@@ -363,27 +362,26 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             if stop_event.is_set(): return
             
-            # Создаем HTML файл
-            html_content = f"""
-            <!DOCTYPE html>
-            <html lang="ru">
-            <head>
-                <meta charset="UTF-8">
-                <title>Решение задачи от MogAI</title>
-                <style>
-                    body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; padding: 20px; max-width: 800px; margin: 0 auto; background-color: #f4f4f9; color: #333; }}
-                    h1 {{ color: #2c3e50; text-align: center; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
-                    .solution {{ background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); white-space: pre-wrap; font-size: 16px; }}
-                    .footer {{ text-align: center; margin-top: 20px; font-size: 12px; color: #7f8c8d; }}
-                </style>
-            </head>
-            <body>
-                <h1>📝 Решение задачи</h1>
-                <div class="solution">{ai_response.replace(chr(10), '<br>')}</div>
-                <div class="footer">Сгенерировано MogAI</div>
-            </body>
-            </html>
-            """
+            # Создаем HTML файл (заменили chr(10) на \n)
+            safe_response = ai_response.replace('\n', '<br>')
+            html_content = f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Решение задачи от MogAI</title>
+    <style>
+        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; padding: 20px; max-width: 800px; margin: 0 auto; background-color: #f4f4f9; color: #333; }}
+        h1 {{ color: #2c3e50; text-align: center; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
+        .solution {{ background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); white-space: pre-wrap; font-size: 16px; }}
+        .footer {{ text-align: center; margin-top: 20px; font-size: 12px; color: #7f8c8d; }}
+    </style>
+</head>
+<body>
+    <h1>📝 Решение задачи</h1>
+    <div class="solution">{safe_response}</div>
+    <div class="footer">Сгенерировано MogAI</div>
+</body>
+</html>"""
             
             file_stream = io.BytesIO(html_content.encode('utf-8'))
             file_stream.name = "Reshenie.html"
