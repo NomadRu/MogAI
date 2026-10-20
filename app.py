@@ -25,9 +25,17 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 if not TOKEN or not GEMINI_KEY:
     raise ValueError("Не заданы TELEGRAM_TOKEN или GEMINI_API_KEY!")
 
-# Используем только проверенную и стабильную модель Google
-GEMINI_TEXT_MODEL = "gemini-2.5-flash"
-GEMINI_VISION_MODEL = "gemini-2.5-flash"
+# Список моделей Google для перебора (от лучшей к запасной)
+GEMINI_TEXT_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite"
+]
+GEMINI_VISION_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite"
+]
 GEMINI_PROXY = "https://gemini-proxy.bold-violet-3c8d.workers.dev"
 
 # --- КЛАВИАТУРЫ ---
@@ -129,12 +137,12 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: await query.edit_message_text("⏹ <b>Запрос отменён.</b>", parse_mode="HTML")
     except Exception: pass
 
-# --- УМНЫЙ ЗАПРОС К GEMINI (С ПОВТОРАМИ) ---
+# --- ЗАПРОС К GEMINI С ПЕРЕБОРОМ МОДЕЛЕЙ ---
 def ask_gemini_text(messages: list) -> str:
     contents = []
     system_instruction = (
         "Ты — MogAI. Отвечай обычным текстом. "
-        "Используй таблицы (Markdown) ТОЛЬКО если пользователь ЯВНО попросил 'таблицу' или 'сравни в таблице'. "
+        "Используй таблицы (Markdown) ТОЛЬКО если пользователь ЯВНО попросил 'таблицу'. "
         "Код оформляй в ```язык ... ```."
     )
     contents.append({"role": "user", "parts": [{"text": system_instruction}]})
@@ -143,59 +151,79 @@ def ask_gemini_text(messages: list) -> str:
         role = "user" if msg["role"] == "user" else "model"
         contents.append({"role": role, "parts": [{"text": msg["content"]}]})
 
-    url = f"{GEMINI_PROXY}/v1beta/models/{GEMINI_TEXT_MODEL}:generateContent?key={GEMINI_KEY}"
-    
-    # 3 попытки с паузой
-    for attempt in range(3):
-        try:
-            response = requests.post(url=url, headers={"Content-Type": "application/json"}, 
-                json={"contents": contents, "generationConfig": {"maxOutputTokens": 3000}}, timeout=30)
-            data = response.json()
-            
-            if "error" not in data and "candidates" in data:
-                return data["candidates"][0]["content"]["parts"][0]["text"]
-            
-            code = data.get("error", {}).get("code")
-            if code in (503, 429):
-                logger.warning(f"Попытка {attempt+1}: Google перегружен (код {code}). Ждем...")
-                time.sleep(2 + attempt * 2) # Ждем 2, потом 4 секунды
+    last_error = "Все модели Google недоступны"
+    for model in GEMINI_TEXT_MODELS:
+        url = f"{GEMINI_PROXY}/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+        
+        # Для каждой модели 2 попытки
+        for attempt in range(2):
+            try:
+                response = requests.post(url=url, headers={"Content-Type": "application/json"}, 
+                    json={"contents": contents, "generationConfig": {"maxOutputTokens": 3000}}, timeout=30)
+                data = response.json()
+                
+                if "error" not in data and "candidates" in data:
+                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                
+                code = data.get("error", {}).get("code")
+                err_msg = data.get("error", {}).get("message", "")
+                last_error = f"{model}: {err_msg}"
+                
+                # Если перегрузка или лимит — пробуем еще раз или следующую модель
+                if code in (503, 429):
+                    logger.warning(f"Модель {model} перегружена (попытка {attempt+1})")
+                    time.sleep(1 + attempt)
+                    continue
+                
+                # Если модель не найдена — сразу к следующей
+                if code == 404 or "not found" in err_msg.lower():
+                    break
+                
+                return f"⚠️ Ошибка Google: {err_msg}"
+                
+            except Exception as e:
+                last_error = f"{model}: {str(e)}"
+                logger.error(f"Сбой на {model}: {e}")
+                time.sleep(1)
                 continue
-            
-            return f"⚠️ Ошибка Google: {data.get('error', {}).get('message')}"
-            
-        except Exception as e:
-            logger.error(f"Сбой сети: {e}")
-            if attempt == 2: return "⚠️ Не удалось связаться с Google. Попробуйте позже."
-            time.sleep(2)
-            
-    return "⚠️ Google не отвечает (перегрузка). Попробуйте через минуту."
+    
+    return f"⚠️ Google не отвечает. Последняя ошибка: {last_error}"
 
 def ask_gemini_vision(image_b64: str, user_text: str) -> str:
-    url = f"{GEMINI_PROXY}/v1beta/models/{GEMINI_VISION_MODEL}:generateContent?key={GEMINI_KEY}"
+    last_error = "Все модели Google Vision недоступны"
     
-    for attempt in range(2):
-        try:
-            response = requests.post(url=url, headers={"Content-Type": "application/json"}, 
-                json={"contents": [{"parts": [{"text": user_text}, {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}}]}]}, timeout=40)
-            data = response.json()
-            
-            if "error" not in data and "candidates" in data:
-                return data["candidates"][0]["content"]["parts"][0]["text"]
-            
-            code = data.get("error", {}).get("code")
-            if code in (503, 429):
-                time.sleep(3)
+    for model in GEMINI_VISION_MODELS:
+        url = f"{GEMINI_PROXY}/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+        
+        for attempt in range(2):
+            try:
+                response = requests.post(url=url, headers={"Content-Type": "application/json"}, 
+                    json={"contents": [{"parts": [{"text": user_text}, {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}}]}]}, timeout=40)
+                data = response.json()
+                
+                if "error" not in data and "candidates" in data:
+                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                
+                code = data.get("error", {}).get("code")
+                err_msg = data.get("error", {}).get("message", "")
+                last_error = f"{model}: {err_msg}"
+                
+                if code in (503, 429):
+                    time.sleep(1 + attempt)
+                    continue
+                if code == 404 or "not found" in err_msg.lower():
+                    break
+                return f"⚠️ Ошибка Google (фото): {err_msg}"
+                
+            except Exception as e:
+                last_error = f"{model}: {str(e)}"
+                time.sleep(1)
                 continue
-            return f"⚠️ Ошибка Google (фото): {data.get('error', {}).get('message')}"
-        except Exception:
-            if attempt == 1: return "⚠️ Google не смог обработать фото."
-            time.sleep(2)
-            
-    return "⚠️ Google перегружен. Попробуйте позже."
+    
+    return f"⚠️ Google не смог обработать фото. Ошибка: {last_error}"
 
 # --- ОТПРАВКА ---
 async def send_safe_message(update: Update, text: str):
-    # Рисуем таблицу ТОЛЬКО если она есть в ответе
     if "|" in text and "-" in text:
         png_buffer = markdown_to_png(text)
         if png_buffer:
@@ -273,7 +301,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         history.append({"role": "user", "content": user_text})
         if len(history) > 8: history = history[-8:]
         
-        # Вызов Google
         ai_response = await asyncio.to_thread(ask_gemini_text, history)
         
         if stop_event.is_set(): return
