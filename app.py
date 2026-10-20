@@ -52,7 +52,11 @@ def modify_image_pollinations(image_url: str, prompt: str) -> str:
 # --- ЗАПРОСЫ К GEMINI ---
 def ask_ai(messages: list) -> str:
     contents = []
-    system_instruction = "Ты — MogAI. Отвечай текстом. Используй HTML-теги для форматирования (например, <b>жирный</b>, <i>курсив</i>, <code>код</code>). КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО выводить JSON-код."
+    system_instruction = (
+        "Ты — MogAI. Отвечай текстом. Используй HTML-теги для форматирования (например, <b>жирный</b>, <i>курсив</i>). "
+        "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО выводить JSON-код. Если нужно написать математическую формулу, напиши её обычным текстом, "
+        "без сложных LaTeX-конструкций с обратными слэшами, чтобы Telegram мог её отобразить."
+    )
     contents.append({"role": "user", "parts": [{"text": system_instruction}]})
     
     for msg in messages:
@@ -91,6 +95,24 @@ def ask_ai_with_image(image_b64: str, user_text: str) -> str:
         except Exception:
             continue
     return "⚠️ Не удалось обработать фото."
+
+# --- УМНАЯ ОТПРАВКА (ИСПРАВЛЕНИЕ ЗАВИСАНИЙ) ---
+async def send_safe_message(update: Update, text: str):
+    """Пытается отправить HTML, если ошибка — отправляет обычный текст. Если текст длинный — создает файл."""
+    # Если текст слишком длинный (больше 4000 символов), отправляем файлом
+    if len(text) > 4000:
+        file_stream = io.BytesIO(text.encode('utf-8'))
+        file_stream.name = "MogAI_Otvet.txt"
+        await update.message.reply_document(document=file_stream, caption="📄 Ответ слишком длинный, я сохранил его в файл.")
+        return
+
+    try:
+        # Пытаемся отправить с HTML (жирный, курсив)
+        await update.message.reply_text(text, parse_mode="HTML")
+    except Exception as e:
+        logger.warning(f"Ошибка HTML: {e}. Отправляем как обычный текст.")
+        # Если HTML сломался (например, из-за формул), отправляем чистый текст
+        await update.message.reply_text(text)
 
 # --- КОМАНДЫ ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -133,7 +155,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• /reset — сброс памяти\n"
             "• <b>Генерация:</b> «нарисуй закат»\n"
             "• <b>Изменение фото:</b> пришли фото с подписью «сделай его в стиле киберпанк»\n"
-            "• <b>Создание файла:</b> «создай файл: Привет!»"
+            "• <b>Создание файла:</b> «создай файл: Привет!»\n"
+            "• Если ответ содержит сложные формулы, я пришлю его текстовым файлом."
         )
         await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
@@ -147,11 +170,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prompt = user_text.replace("нарисуй", "").replace("сгенерируй", "").strip()
         if not prompt: prompt = "beautiful landscape"
         image_url = generate_image(prompt)
-        # Убрали parse_mode, чтобы символы вроде _ или * не ломали отправку
         await update.message.reply_photo(photo=image_url, caption=f"🎨 Вот картинка по запросу: {prompt}")
         return
 
-    # 2. СОЗДАНИЕ TXT ФАЙЛА
+    # 2. СОЗДАНИЕ TXT ФАЙЛА ВРУЧНУЮ
     if "создай файл" in user_text or "сделай файл" in user_text:
         await update.message.chat.send_action(action="upload_document")
         content = user_text.split("файл", 1)[1].replace(":", "").strip()
@@ -170,8 +192,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ai_response = ask_ai(history)
     history.append({"role": "assistant", "content": ai_response})
     context.user_data["history"] = history
-    # Здесь parse_mode="HTML" превратит <b> в жирный
-    await update.message.reply_text(ai_response, parse_mode="HTML")
+    
+    # Используем безопасную отправку!
+    await send_safe_message(update, ai_response)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action(action="upload_photo")
@@ -183,7 +206,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if "сделай" in caption.lower() or "измени" in caption.lower():
         try:
-            # Формируем ссылку на файл Telegram
             file_url = photo_file.file_path
             if not file_url:
                 file_url = f"https://api.telegram.org/file/bot{TOKEN}/{photo_file.file_path}"
@@ -192,10 +214,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not prompt: prompt = "cyberpunk style"
             
             modified_url = modify_image_pollinations(file_url, prompt)
-            
             response = requests.get(modified_url, timeout=60)
             if response.status_code == 200:
-                # Без parse_mode в подписи к фото
                 await update.message.reply_photo(photo=response.content, caption=f"🖌️ Фото изменено по запросу: {prompt}")
             else:
                 raise Exception("Не удалось скачать картинку")
@@ -205,7 +225,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         if not caption: caption = "Что на фото? Опиши."
         ai_response = ask_ai_with_image(image_b64, caption)
-        await update.message.reply_text(ai_response, parse_mode="HTML")
+        await send_safe_message(update, ai_response)
 
 # --- ЗАПУСК ---
 if __name__ == "__main__":
