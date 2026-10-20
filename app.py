@@ -5,6 +5,7 @@ import logging
 import io
 import asyncio
 import re
+import time
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -20,19 +21,14 @@ logger = logging.getLogger(__name__)
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 URL = os.environ.get("RENDER_EXTERNAL_URL")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
-OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
 
 if not TOKEN or not GEMINI_KEY:
     raise ValueError("Не заданы TELEGRAM_TOKEN или GEMINI_API_KEY!")
 
-# Модели Gemini (сначала быстрые и стабильные, потом мощные)
-GEMINI_TEXT_MODELS = ["gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash"]
-GEMINI_VISION_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash"]
+# Используем только проверенную и стабильную модель Google
+GEMINI_TEXT_MODEL = "gemini-2.5-flash"
+GEMINI_VISION_MODEL = "gemini-2.5-flash"
 GEMINI_PROXY = "https://gemini-proxy.bold-violet-3c8d.workers.dev"
-
-# OpenRouter оставляем только как глубокий резерв (если Gemini вообще лег)
-OPENROUTER_TEXT_MODEL = "openrouter/free"
-OPENROUTER_VISION_MODELS = ["nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", "google/gemma-4-31b-it:free"]
 
 # --- КЛАВИАТУРЫ ---
 def get_main_keyboard():
@@ -133,13 +129,13 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: await query.edit_message_text("⏹ <b>Запрос отменён.</b>", parse_mode="HTML")
     except Exception: pass
 
-# --- ЗАПРОСЫ (ТЕКСТ) ---
+# --- УМНЫЙ ЗАПРОС К GEMINI (С ПОВТОРАМИ) ---
 def ask_gemini_text(messages: list) -> str:
     contents = []
     system_instruction = (
-        "Ты — MogAI, умный и полезный ИИ-ассистент. Отвечай подробно и по делу. "
-        "Если пользователь просит таблицу, ВСЕГДА используй формат Markdown: | Столбец1 | Столбец2 |\n|---|---|\n| Данные | Данные |. "
-        "Если пишешь код, ВСЕГДА используй тройные обратные кавычки с указанием языка: ```python ... ```."
+        "Ты — MogAI. Отвечай обычным текстом. "
+        "Используй таблицы (Markdown) ТОЛЬКО если пользователь ЯВНО попросил 'таблицу' или 'сравни в таблице'. "
+        "Код оформляй в ```язык ... ```."
     )
     contents.append({"role": "user", "parts": [{"text": system_instruction}]})
     
@@ -147,88 +143,65 @@ def ask_gemini_text(messages: list) -> str:
         role = "user" if msg["role"] == "user" else "model"
         contents.append({"role": role, "parts": [{"text": msg["content"]}]})
 
-    # Перебираем ТОЛЬКО модели Gemini
-    for model in GEMINI_TEXT_MODELS:
-        url = f"{GEMINI_PROXY}/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+    url = f"{GEMINI_PROXY}/v1beta/models/{GEMINI_TEXT_MODEL}:generateContent?key={GEMINI_KEY}"
+    
+    # 3 попытки с паузой
+    for attempt in range(3):
         try:
             response = requests.post(url=url, headers={"Content-Type": "application/json"}, 
-                json={"contents": contents, "generationConfig": {"maxOutputTokens": 3000}}, timeout=25)
+                json={"contents": contents, "generationConfig": {"maxOutputTokens": 3000}}, timeout=30)
             data = response.json()
             
             if "error" not in data and "candidates" in data:
                 return data["candidates"][0]["content"]["parts"][0]["text"]
             
-            # Если перегрузка или лимит — пробуем следующую модель Gemini
-            if data.get("error", {}).get("code") in (503, 429): 
-                logger.warning(f"Модель {model} перегружена. Пробуем следующую...")
+            code = data.get("error", {}).get("code")
+            if code in (503, 429):
+                logger.warning(f"Попытка {attempt+1}: Google перегружен (код {code}). Ждем...")
+                time.sleep(2 + attempt * 2) # Ждем 2, потом 4 секунды
                 continue
             
-            # Если другая ошибка (например, неверный запрос) — возвращаем её
-            return f"⚠️ Ошибка Gemini: {data.get('error', {}).get('message')}"
+            return f"⚠️ Ошибка Google: {data.get('error', {}).get('message')}"
             
-        except Exception as e: 
-            logger.error(f"Сбой на {model}: {e}")
-            continue
+        except Exception as e:
+            logger.error(f"Сбой сети: {e}")
+            if attempt == 2: return "⚠️ Не удалось связаться с Google. Попробуйте позже."
+            time.sleep(2)
             
-    # Если ВСЕ модели Gemini легли, идем в OpenRouter (последний шанс)
-    logger.warning("Все модели Gemini недоступны. Переключаюсь на OpenRouter.")
-    return ask_openrouter_text(messages)
+    return "⚠️ Google не отвечает (перегрузка). Попробуйте через минуту."
 
-# --- ЗАПРОСЫ (ФОТО) ---
 def ask_gemini_vision(image_b64: str, user_text: str) -> str:
-    for model in GEMINI_VISION_MODELS:
-        url = f"{GEMINI_PROXY}/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+    url = f"{GEMINI_PROXY}/v1beta/models/{GEMINI_VISION_MODEL}:generateContent?key={GEMINI_KEY}"
+    
+    for attempt in range(2):
         try:
             response = requests.post(url=url, headers={"Content-Type": "application/json"}, 
                 json={"contents": [{"parts": [{"text": user_text}, {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}}]}]}, timeout=40)
             data = response.json()
+            
             if "error" not in data and "candidates" in data:
                 return data["candidates"][0]["content"]["parts"][0]["text"]
-            if data.get("error", {}).get("code") in (503, 429): 
-                logger.warning(f"Vision {model} перегружен. Пробуем следующую...")
+            
+            code = data.get("error", {}).get("code")
+            if code in (503, 429):
+                time.sleep(3)
                 continue
-            return f"⚠️ Ошибка Gemini (фото): {data.get('error', {}).get('message')}"
-        except Exception: continue
-    
-    logger.warning("Все модели Gemini Vision недоступны. Резерв OpenRouter.")
-    return ask_openrouter_vision(image_b64, user_text, [])
-
-# --- РЕЗЕРВ (OPENROUTER) ---
-def ask_openrouter_text(messages: list) -> str:
-    if not OPENROUTER_KEY: return "⚠️ Все модели Gemini перегружены, а ключа OpenRouter нет."
-    or_messages = [{"role": "system", "content": "Ты — MogAI. Отвечай текстом."}]
-    for msg in messages[-6:]: or_messages.append({"role": msg["role"], "content": msg["content"]})
-    try:
-        response = requests.post("https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"},
-            json={"model": OPENROUTER_TEXT_MODEL, "messages": or_messages, "max_tokens": 3000}, timeout=30)
-        data = response.json()
-        if "error" in data: return f"⚠️ Ошибка OpenRouter (резерв): {data['error'].get('message')}"
-        return data["choices"][0]["message"]["content"]
-    except Exception as e: return f"⚠️ Сбой резерва: {e}"
-
-def ask_openrouter_vision(image_b64: str, user_text: str, history: list) -> str:
-    if not OPENROUTER_KEY: return "⚠️ Все модели Gemini Vision перегружены, а ключа OpenRouter нет."
-    messages = [{"role": "user", "content": [{"type": "text", "text": user_text or "Что на фото?"}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}]}]
-    last_err = "Нет доступных моделей"
-    for model in OPENROUTER_VISION_MODELS:
-        try:
-            response = requests.post("https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"},
-                json={"model": model, "messages": messages, "max_tokens": 3000}, timeout=30)
-            data = response.json()
-            if "error" in data: last_err = data["error"].get("message"); continue
-            return data["choices"][0]["message"]["content"]
-        except Exception as e: last_err = str(e); continue
-    return f"⚠️ Ошибка обработки фото (резерв). {last_err}"
+            return f"⚠️ Ошибка Google (фото): {data.get('error', {}).get('message')}"
+        except Exception:
+            if attempt == 1: return "⚠️ Google не смог обработать фото."
+            time.sleep(2)
+            
+    return "⚠️ Google перегружен. Попробуйте позже."
 
 # --- ОТПРАВКА ---
 async def send_safe_message(update: Update, text: str):
-    png_buffer = markdown_to_png(text)
-    if png_buffer:
-        await update.message.reply_photo(photo=png_buffer, caption="📊 Вот твоя таблица!")
-        text = re.sub(r'^\|.*\|$', '', text, flags=re.MULTILINE).strip()
-        if not text: return
+    # Рисуем таблицу ТОЛЬКО если она есть в ответе
+    if "|" in text and "-" in text:
+        png_buffer = markdown_to_png(text)
+        if png_buffer:
+            await update.message.reply_photo(photo=png_buffer, caption="📊 Вот твоя таблица!")
+            text = re.sub(r'^\|.*\|$', '', text, flags=re.MULTILINE).strip()
+            if not text: return
 
     if len(text) > 3500:
         file_stream = io.BytesIO(text.encode('utf-8'))
@@ -248,10 +221,10 @@ async def send_safe_message(update: Update, text: str):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["history"] = []
     text = (
-        "👋 <b>Привет! Я MogAI.</b>\n\n"
+        "👋 <b>Привет! Я MogAI (на базе Google).</b>\n\n"
         "Я умею:\n"
         "💬 Отвечать на вопросы\n"
-        "📊 <b>Создавать таблицы</b> (нарисую их как PNG-фото)\n"
+        "📊 <b>Создавать таблицы</b> (если попросишь)\n"
         "📄 <b>Создавать .txt файлы</b>\n"
         "🧮 <b>Решать задачи по фото</b>\n\n"
         "<b>Задай вопрос!</b>"
@@ -300,7 +273,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         history.append({"role": "user", "content": user_text})
         if len(history) > 8: history = history[-8:]
         
-        # Вызов Gemini (с внутренним перебором моделей)
+        # Вызов Google
         ai_response = await asyncio.to_thread(ask_gemini_text, history)
         
         if stop_event.is_set(): return
@@ -326,10 +299,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         image_b64 = base64.b64encode(file_bytes).decode("utf-8")
-        caption = update.message.caption or "Что на фото? Реши задачу."
+        caption = update.message.caption or "Что на фото?"
         history = context.user_data.get("history", [])
         
-        # Вызов Gemini Vision
         ai_response = await asyncio.to_thread(ask_gemini_vision, image_b64, caption)
         
         if stop_event.is_set(): return
