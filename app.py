@@ -35,6 +35,7 @@ GROQ_KEY = os.environ.get("GROQ_API_KEY")
 if not TOKEN or not GROQ_KEY:
     raise ValueError("Не заданы TELEGRAM_TOKEN или GROQ_API_KEY!")
 
+# --- МОДЕЛИ GROQ ---
 GROQ_TEXT_MODELS = [
     "llama-3.1-8b-instant",
     "llama-3.3-70b-versatile",
@@ -77,6 +78,8 @@ def markdown_to_png(text: str) -> io.BytesIO:
                 if all(re.match(r'^:?-+:?$', p) for p in parts if p): continue
                 if any(p for p in parts): table_data.append(parts)
         if len(table_data) < 2: return None
+        
+        # Если текст в ячейках слишком длинный — не рисуем картинку, а отправляем текстом
         for row in table_data:
             for cell in row:
                 if len(cell) > 40: return None
@@ -171,23 +174,26 @@ def ask_groq_text(messages: list) -> str:
     return f"⚠️ Ошибка Groq: {last_error}"
 
 def ask_groq_vision(image_b64: str, user_text: str, history: list) -> str:
-    # Формируем историю для Groq (только текст, без картинок)
-    messages = [{"role": "system", "content": "Ты — MogAI. Отвечай текстом."}]
-    for msg in history[-6:]:
-        # Если это было фото — заменяем на текст
-        if isinstance(msg["content"], list):
-            messages.append({"role": msg["role"], "content": "[Пользователь отправил фото]"})
-        else:
-            messages.append({"role": msg["role"], "content": msg["content"]})
-            
-    # Добавляем текущее фото
-    messages.append({
-        "role": "user",
-        "content": [
-            {"type": "text", "text": user_text or "Что на фото? Реши задачу."},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
-        ]
-    })
+    # Формируем историю как обычный текст
+    history_text = ""
+    for msg in history[-4:]:
+        role_name = "Пользователь" if msg["role"] == "user" else "MogAI"
+        content = "[Фото]" if isinstance(msg["content"], list) else msg["content"]
+        history_text += f"{role_name}: {content}\n"
+    
+    # Склеиваем историю и текущий вопрос
+    full_prompt = f"Предыдущий диалог:\n{history_text}\n\nТекущий вопрос: {user_text or 'Что на фото? Реши задачу.'}"
+
+    # Отправляем без системного промпта, только один user с текстом и картинкой
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": full_prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
+            ]
+        }
+    ]
 
     last_error = "Vision-модель не найдена"
     for model in GROQ_VISION_MODELS:
@@ -374,7 +380,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             history = context.user_data.get("history", [])
             
-            # Передаем историю (с заменой фото на текст) + текущее фото
             ai_response = await asyncio.to_thread(ask_groq_vision, image_b64, caption, history)
             
             if stop_event.is_set(): return
