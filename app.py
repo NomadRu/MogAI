@@ -8,7 +8,9 @@ import re
 import time
 import json
 import traceback
-from pptx import Presentation
+from docx import Document
+from docx.shared import Pt, Cm
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 
 try:
     import matplotlib
@@ -179,62 +181,102 @@ def ask_gemini_vision(image_b64: str, user_text: str) -> str:
                 time.sleep(1); continue
     return f"⚠️ Ошибка обработки фото: {last_error}"
 
-# --- СОЗДАНИЕ ПРЕЗЕНТАЦИИ ---
-def create_presentation(topic: str) -> io.BytesIO:
+# --- СОЗДАНИЕ РЕФЕРАТА ПО ГОСТУ ---
+def create_gost_document(topic: str) -> io.BytesIO:
+    # 1. Просим ИИ написать текст реферата
     prompt = (
-        f"Создай структуру для презентации на тему: '{topic}'. "
-        "Ответь СТРОГО в формате JSON. "
-        'Формат: {"title": "Заголовок", "slides": [{"title": "Название слайда", "content": "Текст слайда"}]}. '
-        "Сделай 3-5 слайдов."
+        f"Напиши текст для реферата на тему: '{topic}'. "
+        "Структура: Введение (актуальность), Основная часть (2-3 раздела), Заключение, Список литературы. "
+        "Объем текста: примерно 1500-2000 слов. Пиши академическим языком. "
+        "НЕ используй Markdown-разметку (звездочки, решетки), просто чистый текст с абзацами. "
+        "Заголовки разделов пиши с новой строки и выделяй их заглавными буквами (например: ВВЕДЕНИЕ)."
     )
     url = f"{GEMINI_PROXY}/v1beta/models/{GEMINI_TEXT_MODELS[0]}:generateContent?key={GEMINI_KEY}"
     
-    raw_text = ""
     try:
         response = requests.post(url=url, headers={"Content-Type": "application/json"}, 
-            json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 1500}}, timeout=30)
+            json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 4000}}, timeout=60)
         data = response.json()
         
         if "error" in data:
-            logger.error(f"Google API Error: {data['error']}")
+            logger.error(f"Google API Error (реферат): {data['error']}")
             return None
             
         raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-        logger.info(f"Ответ от Google для презентации: {raw_text[:200]}...")
+        # Убираем возможные артефакты Markdown
+        raw_text = re.sub(r'\*\*|__|\*|_|#', '', raw_text)
         
-        # Очистка от возможных ```json ... ```
-        raw_text = re.sub(r'```json|```', '', raw_text).strip()
-        
-        # Вырезаем JSON из текста, если ИИ добавил что-то лишнее
-        json_match = re.search(r'\{[\s\S]*\}', raw_text)
-        if json_match:
-            raw_text = json_match.group(0)
-            
-        pres_data = json.loads(raw_text)
-        
-    except json.JSONDecodeError as e:
-        logger.error(f"Не удалось распарсить JSON: {e}. Текст: {raw_text}")
-        return None
     except Exception as e:
-        logger.error(f"Ошибка при запросе к Google: {e}")
+        logger.error(f"Ошибка при запросе к Google (реферат): {e}")
         return None
 
+    # 2. Собираем Word-документ по ГОСТу
     try:
-        prs = Presentation()
-        slide = prs.slides.add_slide(prs.slide_layouts[0])
-        slide.shapes.title.text = str(pres_data.get("title", topic))
-        slide.placeholders[1].text = "Создано MogAI"
-
-        for slide_info in pres_data.get("slides", []):
-            slide = prs.slides.add_slide(prs.slide_layouts[1])
-            slide.shapes.title.text = str(slide_info.get("title", "Слайд"))
-            slide.shapes.placeholders[1].text_frame.text = str(slide_info.get("content", ""))
+        doc = Document()
+        
+        # Настройка стилей по ГОСТ (Times New Roman, 14, полуторный интервал)
+        style = doc.styles['Normal']
+        style.font.name = 'Times New Roman'
+        style.font.size = Pt(14)
+        
+        # Настройка полей (левое 3 см, правое 1.5 см, верхнее/нижнее 2 см)
+        for section in doc.sections:
+            section.left_margin = Cm(3)
+            section.right_margin = Cm(1.5)
+            section.top_margin = Cm(2)
+            section.bottom_margin = Cm(2)
             
+        # Функция для добавления абзаца с правильным форматированием
+        def add_gost_paragraph(text, is_heading=False):
+            p = doc.add_paragraph()
+            p.paragraph_format.line_spacing_rule = WD_LINE_SPACING.ONE_POINT_FIVE
+            p.paragraph_format.first_line_indent = Cm(1.25) # Красная строка
+            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            
+            if is_heading:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                p.paragraph_format.first_line_indent = Cm(0)
+                run = p.add_run(text.upper())
+                run.bold = True
+            else:
+                p.add_run(text)
+            return p
+
+        # Титульный лист (упрощенный)
+        title_p = doc.add_paragraph()
+        title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = title_p.add_run("РЕФЕРАТ")
+        run.bold = True
+        run.font.size = Pt(20)
+        
+        doc.add_paragraph()
+        
+        topic_p = doc.add_paragraph()
+        topic_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = topic_p.add_run(f"на тему: «{topic}»")
+        run.bold = True
+        run.font.size = Pt(16)
+        
+        doc.add_paragraph("\n\n\n\n\n\n\n\n\n\n")
+        
+        # Разбиваем текст на строки и добавляем в документ
+        lines = raw_text.split('\n')
+        for line in lines:
+            line = line.strip()
+            if not line: continue
+            
+            # Если строка похожа на заголовок (короткая, заглавные буквы)
+            if len(line) < 50 and (line.isupper() or line.endswith(':')):
+                add_gost_paragraph(line, is_heading=True)
+                doc.add_paragraph() # Пустая строка после заголовка
+            else:
+                add_gost_paragraph(line)
+                
         buf = io.BytesIO()
-        prs.save(buf); buf.seek(0)
+        doc.save(buf); buf.seek(0)
         return buf
     except Exception as e:
-        logger.error(f"Ошибка при сборке PPTX: {e}")
+        logger.error(f"Ошибка при сборке DOCX: {e}")
         return None
 
 # --- ОТПРАВКА ---
@@ -266,9 +308,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💬 Отвечать на вопросы\n"
         "📊 <b>Создавать таблицы</b> (PNG)\n"
         "📄 <b>Создавать .txt файлы</b>\n"
-        "🧮 <b>Решать задачи по фото</b>\n"
-        "📽️ <b>Создавать презентации</b> (.pptx)\n\n"
-        "Напиши: <i>«сделай презентацию про [тема]»</i>"
+        "📝 <b>Писать рефераты по ГОСТу</b> (.docx)\n"
+        "🧮 <b>Решать задачи по фото</b>\n\n"
+        "Напиши: <i>«напиши реферат на тему [тема]»</i>"
     )
     await update.message.reply_text(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
@@ -291,28 +333,38 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["history"] = []
         await query.edit_message_text("🧹 Новый чат!", reply_markup=get_main_keyboard())
     elif query.data == "help":
-        text = "🤖 <b>Команды:</b>\n• /reset — сброс\n• «сделай таблицу»\n• «сделай презентацию про...»\n• Пришли фото задачи."
+        text = "🤖 <b>Команды:</b>\n• /reset — сброс\n• «сделай таблицу»\n• «напиши реферат про...»\n• Пришли фото задачи."
         await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user_text = update.message.text.lower()
-        if "презентаци" in user_text or "слайд" in user_text:
-            match = re.search(r'про\s+(.+)', user_text)
+        
+        # 1. СОЗДАНИЕ РЕФЕРАТА
+        if "реферат" in user_text or "доклад" in user_text:
+            match = re.search(r'(?:на тему|про)\s+(.+)', user_text)
             topic = match.group(1) if match else "Интересные факты"
+            
             stop_event = asyncio.Event(); context.user_data["stop_event"] = stop_event
             anim = asyncio.create_task(animate_thinking(update, stop_event))
             try:
                 await update.message.chat.send_action(action="upload_document")
-                pptx_buffer = await asyncio.to_thread(create_presentation, topic)
+                docx_buffer = await asyncio.to_thread(create_gost_document, topic)
                 if stop_event.is_set(): return
-                if pptx_buffer:
-                    await update.message.reply_document(document=pptx_buffer, filename=f"Presentation_{topic[:10]}.pptx", caption=f"📽️ Презентация: <b>{topic}</b>", parse_mode="HTML")
-                else: await update.message.reply_text("⚠️ Не удалось создать презентацию.")
+                if docx_buffer:
+                    await update.message.reply_document(
+                        document=docx_buffer, 
+                        filename=f"Referat_{topic[:10]}.docx", 
+                        caption=f"📝 Реферат по ГОСТу: <b>{topic}</b>", 
+                        parse_mode="HTML"
+                    )
+                else: 
+                    await update.message.reply_text("⚠️ Не удалось создать реферат. Возможно, тема слишком сложная или Google перегружен.")
             finally:
                 stop_event.set(); await anim
             return
 
+        # 2. СОЗДАНИЕ ПРОСТОГО ФАЙЛА
         if "создай файл" in user_text:
             await update.message.chat.send_action(action="upload_document")
             content = user_text.split("файл", 1)[1].replace(":", "").strip()
@@ -320,6 +372,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_document(document=file_stream, caption="📄 Файл готов!")
             return
 
+        # 3. ОБЫЧНЫЙ ЧАТ
         stop_event = asyncio.Event(); context.user_data["stop_event"] = stop_event
         anim = asyncio.create_task(animate_thinking(update, stop_event))
         try:
@@ -339,6 +392,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Обработка фото осталась без изменений
     try:
         stop_event = asyncio.Event(); context.user_data["stop_event"] = stop_event
         anim = asyncio.create_task(animate_thinking(update, stop_event))
