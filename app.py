@@ -35,18 +35,17 @@ GROQ_KEY = os.environ.get("GROQ_API_KEY")
 if not TOKEN or not GROQ_KEY:
     raise ValueError("Не заданы TELEGRAM_TOKEN или GROQ_API_KEY!")
 
-# --- СПИСКИ МОДЕЛЕЙ GROQ (от новых к старым) ---
-# Если модель удалили, бот попробует следующую
+# --- АКТУАЛЬНЫЕ МОДЕЛИ GROQ (ИЗ ВАШЕГО СКРИНШОТА) ---
 GROQ_TEXT_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-70b-versatile",
-    "llama3-70b-8192",
-    "mixtral-8x7b-32768"
+    "llama-3.1-8b-instant",            # Самая быстрая
+    "llama-3.3-70b-versatile",         # Умная
+    "meta-llama/llama-3.3-70b-versatile", # С префиксом (на всякий случай)
+    "openai/gpt-oss-20b"               # Резервная
 ]
 
 GROQ_VISION_MODELS = [
-    "llama-3.2-11b-vision-preview",
-    "llama-3.2-90b-vision-preview"
+    "openai/gpt-oss-120b",             # Отлично видит картинки (из вашего списка)
+    "openai/gpt-oss-20b"               # Запасная
 ]
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
