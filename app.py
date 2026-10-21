@@ -63,8 +63,8 @@ def get_stop_keyboard():
 # --- ГЕНЕРАЦИЯ ФОТО (POLLINATIONS) ---
 def generate_image(prompt: str) -> str:
     encoded_prompt = requests.utils.quote(prompt)
-    full_prompt = f"{encoded_prompt}, high quality, detailed, masterpiece"
-    return f"https://image.pollinations.ai/prompt/{full_prompt}?width=1024&height=1024&nologo=true&seed={os.urandom(4).hex()}"
+    # Принудительно ставим модель flux и убираем логотип
+    return f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&model=flux&nologo=true&seed={os.urandom(4).hex()}"
 
 # --- ПАРСЕР ТАБЛИЦ В PNG ---
 def markdown_to_png(text: str) -> io.BytesIO:
@@ -337,7 +337,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["waiting_for_photo_prompt"] = False
             
             await update.message.chat.send_action(action="upload_photo")
-            image_url = generate_image(user_text)
+            
+            # Переводим промпт на английский для лучшего качества
+            translation_prompt = [
+                {"role": "system", "content": "You are a translator. Translate the following text to English for an image generator. Output ONLY the translation, no extra words."},
+                {"role": "user", "content": user_text}
+            ]
+            english_prompt = ask_groq_text(translation_prompt)
+            
+            if "⚠️" in english_prompt:
+                english_prompt = user_text
+            
+            logger.info(f"Оригинал: {user_text} | Перевод: {english_prompt}")
+            
+            image_url = generate_image(english_prompt)
             
             await update.message.reply_photo(
                 photo=image_url, 
