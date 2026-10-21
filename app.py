@@ -8,7 +8,7 @@ import re
 import secrets
 import zlib
 import traceback
-import html
+import json
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 from docx import Document
@@ -45,10 +45,45 @@ if not TOKEN or not GROQ_KEY:
 
 # --- КОНСТАНТЫ ---
 WORDS_PER_PAGE = 280
+MAX_HISTORY = 50  # Максимум 50 сообщений (25 вопросов + 25 ответов)
 GROQ_TEXT_MODELS = ["openai/gpt-oss-20b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 MISTRAL_VISION_MODEL = "pixtral-12b-2409"
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
+MEMORY_FILE = "long_term_memory.json"
+
+# --- ДОЛГОВРЕМЕННАЯ ПАМЯТЬ ---
+def load_memory() -> dict:
+    if os.path.exists(MEMORY_FILE):
+        try:
+            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_memory(memory: dict):
+    try:
+        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(memory, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения памяти: {e}")
+
+def remember_fact(fact: str) -> str:
+    memory = load_memory()
+    facts = memory.get("facts", [])
+    if fact not in facts:
+        facts.append(fact)
+        memory["facts"] = facts
+        save_memory(memory)
+    return "Факт сохранён."
+
+def get_memory_context() -> str:
+    memory = load_memory()
+    facts = memory.get("facts", [])
+    if not facts:
+        return ""
+    return "Важные факты о пользователе (запомни их):\n- " + "\n- ".join(facts)
 
 # --- КЛАВИАТУРЫ ---
 def get_reset_keyboard():
@@ -62,6 +97,11 @@ def get_stop_keyboard():
 
 def get_cancel_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")]])
+
+def get_force_reset_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧹 Сбросить контекст и начать заново", callback_data="force_reset_yes")]
+    ])
 
 # --- ГЕНЕРАЦИЯ ФОТО ---
 def generate_image(prompt: str) -> str:
@@ -233,20 +273,17 @@ def get_current_datetime() -> str:
     return now.strftime("%d.%m.%Y, %H:%M (МСК)")
 
 def search_web(query: str) -> str:
-    """Поиск в интернете через DuckDuckGo (HTML версия)."""
     try:
         url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         r = requests.get(url, headers=headers, timeout=15)
         r.raise_for_status()
         
-        # Простой парсинг результатов из HTML
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(r.text, 'html.parser')
         results = []
         for a in soup.select('.result__a')[:4]:
             title = a.get_text(strip=True)
-            link = a.get('href')
             snippet_el = a.find_parent('.result__body')
             snippet = snippet_el.select_one('.result__snippet').get_text(strip=True) if snippet_el else ""
             results.append(f"{title}: {snippet}")
@@ -302,18 +339,25 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- GROQ С ИНСТРУМЕНТАМИ ---
 def ask_groq_text(messages: list) -> str:
+    memory_context = get_memory_context()
+    
     system_prompt = (
-        "Ты — MogAI, учебный ассистент. Отвечай максимально развёрнуто, грамотно, с примерами и пояснениями. "
-        "Никогда не отказывайся помогать с учебными задачами (рефераты, курсовые, эссе, задачи). "
-        "Если тема кажется игровой или странной, всё равно раскрывай её с научной точки зрения. "
+        "Ты — MogAI, учебный ассистент. Отвечай по существу, грамотно и структурированно. "
+        "НЕ ЛЕЙ ВОДУ. Если вопрос простой — отвечай коротко (1-2 предложения). "
+        "Если просят подробно (или это сложная задача) — расписывай по шагам. "
+        "Никогда не отказывайся помогать с учебными задачами. "
         "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать markdown-таблицы, если пользователь прямо не написал слово 'таблица'. "
-        "Описывай данные обычным текстом или списком. "
-        "Если вопрос касается новостей, свежих данных или фактов после 2024 года — используй инструмент search_web. "
-        "Если нужно узнать текущую дату или время — используй инструмент get_current_datetime. "
-        "Отвечай только на русском языке."
+        "Если вопрос касается новостей или свежих данных — используй инструмент search_web. "
+        "Если нужно узнать текущую дату — используй get_current_datetime. "
+        "Если пользователь просит что-то запомнить — используй инструмент remember_fact. "
     )
+    if memory_context:
+        system_prompt += "\n\n" + memory_context
+
     or_messages = [{"role": "system", "content": system_prompt}]
-    for msg in messages[-8:]:
+    
+    # Контекст до 50 сообщений
+    for msg in messages[-MAX_HISTORY:]:
         or_messages.append({"role": msg["role"], "content": msg["content"]})
 
     tools = [
@@ -329,13 +373,23 @@ def ask_groq_text(messages: list) -> str:
             "type": "function",
             "function": {
                 "name": "search_web",
-                "description": "Ищет информацию в интернете. Используй для новостей, свежих данных, фактов.",
+                "description": "Ищет информацию в интернете. Используй для новостей, свежих данных.",
                 "parameters": {
                     "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Поисковый запрос"}
-                    },
+                    "properties": {"query": {"type": "string"}},
                     "required": ["query"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "remember_fact",
+                "description": "Сохраняет важный факт о пользователе в долговременную память.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"fact": {"type": "string"}},
+                    "required": ["fact"]
                 }
             }
         }
@@ -346,13 +400,13 @@ def ask_groq_text(messages: list) -> str:
             payload = {
                 "model": model,
                 "messages": or_messages,
-                "max_tokens": 4000,
-                "temperature": 0.7,
+                "max_tokens": 2500,
+                "temperature": 0.6,
                 "tools": tools,
                 "tool_choice": "auto"
             }
 
-            for _ in range(3):  # Максимум 3 цикла вызова инструментов
+            for _ in range(3):
                 response = requests.post(
                     url=GROQ_API_URL,
                     headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
@@ -377,6 +431,8 @@ def ask_groq_text(messages: list) -> str:
                             result = get_current_datetime()
                         elif name == "search_web":
                             result = search_web(args.get("query", ""))
+                        elif name == "remember_fact":
+                            result = remember_fact(args.get("fact", ""))
                         else:
                             result = "Инструмент не найден."
                         
@@ -386,7 +442,7 @@ def ask_groq_text(messages: list) -> str:
                             "content": str(result)
                         })
                     payload["messages"] = or_messages
-                    continue  # Повторяем цикл с результатами
+                    continue
                 
                 if msg.get("content"):
                     return msg["content"]
@@ -409,8 +465,8 @@ def ask_mistral_vision(image_b64: str, user_text: str) -> str:
         prompt = (
             f"Пользователь прислал фото и спрашивает: '{user_text}'. "
             "Внимательно посмотри на фото и ответь на вопрос. "
-            "Если на фото есть математика или схемы, используй LaTeX (например, $x^2$ или \\frac{a}{b}) для формул. "
-            "НЕ создавай markdown-таблицы, если пользователь прямо не просит."
+            "Если это задача — распиши решение по шагам. "
+            "Если на фото есть математика, используй LaTeX."
         )
     else:
         prompt = (
@@ -432,7 +488,7 @@ def ask_mistral_vision(image_b64: str, user_text: str) -> str:
         response = requests.post(
             url=MISTRAL_API_URL,
             headers={"Authorization": f"Bearer {MISTRAL_KEY}", "Content-Type": "application/json"},
-            json={"model": MISTRAL_VISION_MODEL, "messages": messages, "max_tokens": 4000},
+            json={"model": MISTRAL_VISION_MODEL, "messages": messages, "max_tokens": 2000},
             timeout=120
         )
         data = response.json()
@@ -768,7 +824,6 @@ async def send_safe_message(update: Update, text: str, user_query: str = ""):
             if not text:
                 text = "Не удалось подобрать удачный ответ. Попробуй переформулировать вопрос."
 
-        # Если есть формулы — добавляем ссылку на визуализатор, а не отправляем файл
         has_math = has_math_formulas(text)
         
         if len(text) > 3500:
@@ -877,10 +932,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🧹 История очищена.", parse_mode="HTML")
     elif query.data == "reset_no":
         await query.edit_message_text("👍 Отмена.", parse_mode="HTML")
+    elif query.data == "force_reset_yes":
+        context.user_data["history"] = []
+        await query.edit_message_text("🧹 Контекст сброшен! Можем продолжать общаться.", parse_mode="HTML")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user_text = update.message.text
+
+        # ПРОВЕРКА НА ЛИМИТ ИСТОРИИ
+        history = context.user_data.get("history", [])
+        if len(history) >= MAX_HISTORY:
+            await update.message.reply_text(
+                "⚠️ <b>Лимит памяти достигнут!</b>\n"
+                f"Я запомнил уже {MAX_HISTORY} сообщений. Чтобы я мог отвечать дальше и не терять контекст, "
+                "нужно сбросить историю. Нажми кнопку ниже.",
+                reply_markup=get_force_reset_keyboard(),
+                parse_mode="HTML"
+            )
+            return
 
         if re.match(r'^https?://', user_text.strip()):
             await update.message.reply_text(
@@ -1011,10 +1081,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stop_event = asyncio.Event(); context.user_data["stop_event"] = stop_event
         anim = asyncio.create_task(animate_thinking(update, stop_event))
         try:
-            history = context.user_data.get("history", [])
             history.append({"role": "user", "content": user_text})
-            if len(history) > 8:
-                history = history[-8:]
+            # Здесь не обрезаем — обрезаем только при отправке в модель
 
             ai_response = await asyncio.to_thread(ask_groq_text, history)
             if stop_event.is_set():
@@ -1022,7 +1090,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if not is_error_response(ai_response):
                 history.append({"role": "assistant", "content": ai_response})
-                context.user_data["history"] = history[-8:]
+                context.user_data["history"] = history
         finally:
             stop_event.set(); await anim
 
@@ -1036,6 +1104,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
+        # Проверка на лимит
+        history = context.user_data.get("history", [])
+        if len(history) >= MAX_HISTORY:
+            await update.message.reply_text(
+                "⚠️ <b>Лимит памяти достигнут!</b>\n"
+                f"Я запомнил уже {MAX_HISTORY} сообщений. Сбрось контекст, чтобы продолжить.",
+                reply_markup=get_force_reset_keyboard(),
+                parse_mode="HTML"
+            )
+            return
+
         stop_event = asyncio.Event(); context.user_data["stop_event"] = stop_event
         anim = asyncio.create_task(animate_thinking(update, stop_event))
         try:
@@ -1061,18 +1140,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if ai_response.startswith("ОПИСАНИЕ:"):
                 clean_desc = ai_response.replace("ОПИСАНИЕ:", "").strip()
                 await update.message.reply_text(f"📸 {clean_desc}")
-                history = context.user_data.get("history", [])
                 history.append({"role": "user", "content": f"[Фото] {caption}"})
                 history.append({"role": "assistant", "content": clean_desc})
-                context.user_data["history"] = history[-8:]
+                context.user_data["history"] = history
                 return
 
             await send_safe_message(update, ai_response, user_query=caption)
 
-            history = context.user_data.get("history", [])
             history.append({"role": "user", "content": f"[Фото] {caption}"})
             history.append({"role": "assistant", "content": ai_response})
-            context.user_data["history"] = history[-8:]
+            context.user_data["history"] = history
         finally:
             stop_event.set(); await anim
     except Exception as e:
@@ -1100,4 +1177,4 @@ if __name__ == "__main__":
         url_path=TOKEN,
         webhook_url=f"{URL}/{TOKEN}",
         drop_pending_updates=False,
-)
+        )
