@@ -62,9 +62,7 @@ def get_stop_keyboard():
 
 # --- ГЕНЕРАЦИЯ ФОТО (POLLINATIONS) ---
 def generate_image(prompt: str) -> str:
-    """Генерирует картинку через Pollinations.ai"""
     encoded_prompt = requests.utils.quote(prompt)
-    # Добавляем теги качества
     full_prompt = f"{encoded_prompt}, high quality, detailed, masterpiece"
     return f"https://image.pollinations.ai/prompt/{full_prompt}?width=1024&height=1024&nologo=true&seed={os.urandom(4).hex()}"
 
@@ -303,13 +301,13 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⚠️ <b>Вы уверены?</b>", reply_markup=get_reset_keyboard(), parse_mode="HTML")
 
 async def photo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Устанавливаем флаг, что ждем промпт для фото
     context.user_data["waiting_for_photo_prompt"] = True
-    await update.message.reply_text(
+    text = (
         "🎨 <b>Режим генерации фото.</b>\n\n"
         "Напиши, что хочешь нарисовать (например: <i>кот в космосе, неоновый город, дракон</i>).\n\n"
         "Контекст чата не сбросится, я просто нарисую картинку."
     )
+    await update.message.reply_text(text, parse_mode="HTML")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -336,7 +334,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # 1. Проверяем, ждем ли мы промпт для фото
         if context.user_data.get("waiting_for_photo_prompt"):
-            context.user_data["waiting_for_photo_prompt"] = False # Сбрасываем флаг
+            context.user_data["waiting_for_photo_prompt"] = False
             
             await update.message.chat.send_action(action="upload_photo")
             image_url = generate_image(user_text)
@@ -346,7 +344,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption=f"🎨 Вот что я нарисовал по запросу: <i>{user_text}</i>", 
                 parse_mode="HTML"
             )
-            return # Выходим, чтобы не идти в обычный чат
+            return
 
         # 2. Обычная логика текста
         lower_text = user_text.lower()
@@ -485,7 +483,7 @@ if __name__ == "__main__":
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset_command))
-    app.add_handler(CommandHandler("photo", photo_command)) # Новая команда
+    app.add_handler(CommandHandler("photo", photo_command))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
