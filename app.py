@@ -8,7 +8,7 @@ import re
 import time
 import traceback
 from docx import Document
-from docx.shared import Pt, Cm, RGBColor
+from docx.shared import Pt, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
@@ -158,7 +158,11 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- ЗАПРОСЫ К GROQ ---
 def ask_groq_text(messages: list) -> str:
-    system_prompt = "Ты — MogAI. Отвечай текстом. Таблицы используй только по прямой просьбе."
+    system_prompt = (
+        "Ты — MogAI, помощник для студентов. Твоя задача — писать строго учебные работы для вузов. "
+        "Никогда не отказывайся писать текст, если это касается учебы (рефераты, курсовые, эссе). "
+        "Отвечай только на русском языке. Используй академический стиль."
+    )
     or_messages = [{"role": "system", "content": system_prompt}]
     for msg in messages[-8:]:
         or_messages.append({"role": msg["role"], "content": msg["content"]})
@@ -169,7 +173,7 @@ def ask_groq_text(messages: list) -> str:
                 url=GROQ_API_URL,
                 headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
                 json={"model": model, "messages": or_messages, "max_tokens": 4000},
-                timeout=40
+                timeout=60
             )
             data = response.json()
             if "error" not in data and "choices" in data:
@@ -212,8 +216,17 @@ def ask_mistral_vision(image_b64: str, user_text: str) -> str:
         return f"⚠️ Сбой Mistral (фото): {e}"
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ WORD ---
+def add_internal_link(paragraph, bookmark_name: str, link_text: str):
+    hyperlink = OxmlElement('w:hyperlink')
+    hyperlink.set(qn('w:anchor'), bookmark_name)
+    r = OxmlElement('w:r')
+    t = OxmlElement('w:t')
+    t.text = link_text
+    r.append(t)
+    hyperlink.append(r)
+    paragraph._p.append(hyperlink)
+
 def add_bookmark(paragraph, bookmark_name: str):
-    """Создает закладку в параграфе для гиперссылки"""
     run = paragraph.add_run()
     tag = run._r
     start = OxmlElement('w:bookmarkStart')
@@ -224,34 +237,23 @@ def add_bookmark(paragraph, bookmark_name: str):
     end.set(qn('w:id'), str(hash(bookmark_name) % 100000))
     tag.append(end)
 
-def add_internal_link(paragraph, bookmark_name: str, link_text: str):
-    """Создает кликабельную ссылку на закладку"""
-    hyperlink = OxmlElement('w:hyperlink')
-    hyperlink.set(qn('w:anchor'), bookmark_name)
-    r = OxmlElement('w:r')
-    t = OxmlElement('w:t')
-    t.text = link_text
-    r.append(t)
-    hyperlink.append(r)
-    paragraph._p.append(hyperlink)
-
-# --- СОЗДАНИЕ РЕФЕРАТА (ОБНОВЛЕННАЯ ВЕРСИЯ) ---
+# --- СОЗДАНИЕ РЕФЕРАТА (ТИТУЛЬНИК ПО ОБРАЗЦУ) ---
 def create_word_document(pages: int, topic: str, student_name: str, group: str, discipline: str, teacher: str, city: str) -> io.BytesIO:
     words_needed = pages * 300
     
-    # Просим ИИ написать текст с "мнением автора"
     prompt = (
-        f"Напиши текст для реферата на тему: '{topic}'. "
-        f"Объем: примерно {words_needed} слов. "
+        f"Напиши академический реферат для студента вуза на тему: '{topic}'. "
+        f"Это обязательная учебная работа. Объем: примерно {words_needed} слов. "
         "Структура: Введение (актуальность, цель, задачи), "
         "Основная часть (3 главы, в каждой 2 подглавы), Заключение, Список литературы. "
-        "Пиши академическим языком, но от первого лица (как студент). "
-        "В КОНЦЕ КАЖДОЙ ПОДГЛАВЫ (после текста) добавь абзац, который начинается со слов 'Мнение автора:' и напиши 2-3 предложения своего отношения к теме. "
+        "Пиши от третьего лица, академическим языком. "
+        "В КОНЦЕ КАЖДОЙ ПОДГЛАВЫ добавь абзац 'Мнение автора:' и напиши 2-3 предложения своего отношения. "
         "Не используй Markdown. Заголовки пиши с новой строки ЗАГЛАВНЫМИ буквами. "
         "Подзаголовки пиши с новой строки, начиная с номера (например, 1.1 Название)."
     )
     raw_text = ask_groq_text([{"role": "user", "content": prompt}])
-    if not raw_text or "⚠️" in raw_text: return None
+    if not raw_text or "⚠️" in raw_text or "I'm sorry" in raw_text: 
+        return None
 
     raw_text = re.sub(r'[*#_`~]', '', raw_text)
     raw_text = "".join(c for c in raw_text if c.isprintable() or c in '\n\r\t')
@@ -259,7 +261,6 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
     try:
         doc = Document()
         
-        # Стили по ГОСТ
         style = doc.styles['Normal']
         style.font.name = 'Times New Roman'
         style.font.size = Pt(14)
@@ -291,48 +292,55 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
                 p.add_run(text)
             return p
 
-        # --- ТИТУЛЬНЫЙ ЛИСТ ---
+        # --- ТИТУЛЬНЫЙ ЛИСТ (КАК НА СКРИНШОТЕ) ---
+        # Шапка с министерством и вузом
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = p.add_run("МИНИСТЕРСТВО ОБРАЗОВАНИЯ И НАУКИ РФ"); run.bold = True
-        
+        run = p.add_run("МИНИСТЕРСТВО ОБРАЗОВАНИЯ И НАУКИ\nРОССИЙСКОЙ ФЕДЕРАЦИИ"); run.bold = True
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = p.add_run("НАЗВАНИЕ ВАШЕГО УЧЕБНОГО ЗАВЕДЕНИЯ"); run.bold = True
+        run = p.add_run("ФЕДЕРАЛЬНОЕ ГОСУДАРСТВЕННОЕ БЮДЖЕТНОЕ\nОБРАЗОВАТЕЛЬНОЕ УЧРЕЖДЕНИЕ\nВЫСШЕГО ОБРАЗОВАНИЯ"); run.bold = True
+        p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = p.add_run("«ПОВОЛЖСКИЙ ГОСУДАРСТВЕННЫЙ\nТЕХНОЛОГИЧЕСКИЙ УНИВЕРСИТЕТ» (ФГБОУ ВО\n«ПГТУ») ВЫСШИЙ КОЛЛЕДЖ ПГТУ «Политехник»"); run.bold = True
         
         for _ in range(4): doc.add_paragraph()
         
+        # Центральный блок
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p.add_run("РЕФЕРАТ").bold = True
-        p.runs[0].font.size = Pt(24)
+        p.add_run("Реферат").bold = True
+        p.runs[0].font.size = Pt(20)
         
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p.add_run(f"по дисциплине: «{discipline}»").bold = True
+        p.add_run(f"по дисциплине «{discipline}»")
+        
+        for _ in range(2): doc.add_paragraph()
+        
+        p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.add_run("на тему:")
+        
+        p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.add_run(f"«{topic}»").bold = True
         p.runs[0].font.size = Pt(16)
-        
-        p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p.add_run(f"на тему: «{topic}»").bold = True
-        p.runs[0].font.size = Pt(18)
         
         for _ in range(6): doc.add_paragraph()
         
-        # Блок исполнителя (справа)
+        # Правый блок (Исполнитель)
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        p.add_run(f"Выполнил: студент группы {group}\n{student_name}")
+        p.add_run(f"Выполнил: обучающийся\nгруппы {group}\n{student_name}")
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        p.add_run(f"Проверил: {teacher}")
+        p.add_run(f"Преподаватель: {teacher}")
         
         for _ in range(8): doc.add_paragraph()
         
+        # Нижний блок
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p.add_run(f"{city}, 2026 г.")
+        p.add_run(f"{city}, 2026")
         
         doc.add_page_break()
 
-        # --- ОГЛАВЛЕНИЕ (КЛИКАБЕЛЬНОЕ) ---
+        # --- ОГЛАВЛЕНИЕ ---
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.add_run("СОДЕРЖАНИЕ").bold = True
         doc.add_paragraph()
         
-        # Список для оглавления (заголовки и их закладки)
         toc_items = [
             ("ВВЕДЕНИЕ", "bookmark_intro"),
             ("ГЛАВА 1.", "bookmark_ch1"),
@@ -354,30 +362,22 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
             p.paragraph_format.first_line_indent = Cm(0)
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
             
-            # Добавляем кликабельную ссылку
             add_internal_link(p, bookmark, title)
-            
-            # Добавляем отступ (табуляцию) для красоты
-            p.add_run("\t")
-            p.add_run("...")
+            p.add_run(" " + "." * 30)
         
         doc.add_page_break()
 
-        # --- ОСНОВНОЙ ТЕКСТ (с закладками) ---
+        # --- ОСНОВНОЙ ТЕКСТ ---
         lines = raw_text.split('\n')
-        current_bookmark = "bookmark_intro"  # Начинаем с введения
-        
         for line in lines:
             line = line.strip()
             if not line: continue
             
-            # Проверяем, не заголовок ли это
             is_heading = len(line) < 60 and (line.isupper() or line.startswith("ГЛАВА") or line.startswith("ВВЕДЕНИЕ") or line.startswith("ЗАКЛЮЧЕНИЕ"))
             is_subheading = re.match(r'^\d+\.\d+', line) and len(line) < 100
             
             if is_heading:
                 p = add_paragraph(line, is_heading=True)
-                # Ставим закладку
                 bookmark_name = f"bookmark_{line[:10].replace(' ', '_').replace('.', '_')}"
                 add_bookmark(p, bookmark_name)
                 doc.add_paragraph()
