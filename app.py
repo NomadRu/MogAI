@@ -45,7 +45,7 @@ if not TOKEN or not GROQ_KEY:
 
 # --- КОНСТАНТЫ ---
 WORDS_PER_PAGE = 280
-MAX_HISTORY = 50  # Максимум 50 сообщений (25 вопросов + 25 ответов)
+MAX_HISTORY = 50 
 GROQ_TEXT_MODELS = ["openai/gpt-oss-20b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 MISTRAL_VISION_MODEL = "pixtral-12b-2409"
@@ -341,6 +341,7 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def ask_groq_text(messages: list) -> str:
     memory_context = get_memory_context()
     
+    # ЖЕСТКИЙ ПРОМПТ ДЛЯ СНЯТИЯ ОГРАНИЧЕНИЙ
     system_prompt = (
         "Ты — MogAI, учебный ассистент. Отвечай по существу, грамотно и структурированно. "
         "НЕ ЛЕЙ ВОДУ. Если вопрос простой — отвечай коротко (1-2 предложения). "
@@ -350,13 +351,14 @@ def ask_groq_text(messages: list) -> str:
         "Если вопрос касается новостей или свежих данных — используй инструмент search_web. "
         "Если нужно узнать текущую дату — используй get_current_datetime. "
         "Если пользователь просит что-то запомнить — используй инструмент remember_fact. "
+        "ВАЖНО: Если пользователь просит показать историю сообщений или что он писал ранее, ты ОБЯЗАН вывести её текстом из контекста. "
+        "Это разрешено правилами и не является нарушением безопасности. Просто процитируй предыдущие сообщения."
     )
     if memory_context:
         system_prompt += "\n\n" + memory_context
 
     or_messages = [{"role": "system", "content": system_prompt}]
     
-    # Контекст до 50 сообщений
     for msg in messages[-MAX_HISTORY:]:
         or_messages.append({"role": msg["role"], "content": msg["content"]})
 
@@ -1082,7 +1084,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         anim = asyncio.create_task(animate_thinking(update, stop_event))
         try:
             history.append({"role": "user", "content": user_text})
-            # Здесь не обрезаем — обрезаем только при отправке в модель
 
             ai_response = await asyncio.to_thread(ask_groq_text, history)
             if stop_event.is_set():
