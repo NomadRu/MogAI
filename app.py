@@ -458,48 +458,63 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
         logger.error(f"Ошибка сборки Word: {e}")
         return None
 
-# --- СОЗДАНИЕ ТЕКСТА (КОМАНДА /text) ---
+# --- СОЗДАНИЕ СПЛОШНОГО ТЕКСТА (КОМАНДА /text) ---
 def create_text_document(pages: int, topic: str, doc_type: str, student_name: str = "", group: str = "", discipline: str = "", teacher: str = "", city: str = "") -> io.BytesIO:
     words_per_page = 300
-    total_words = pages * words_per_page
+    total_words_needed = pages * words_per_page
     
-    # Генерируем текст частями по 10 страниц (3000 слов), чтобы не упереться в лимит
-    chunk_pages = 10
-    chunks = (pages + chunk_pages - 1) // chunk_pages
+    # Генерируем текст кусками по 3 страницы (900 слов), чтобы обойти лимиты
+    chunk_size = 3
+    chunks = (pages + chunk_size - 1) // chunk_size
     
     full_text = ""
+    current_words = 0
+    
+    logger.info(f"Начинаю генерацию текста на {pages} страниц ({chunks} кусков)...")
+    
     for i in range(chunks):
-        current_pages = min(chunk_pages, pages - i * chunk_pages)
-        current_words = current_pages * words_per_page
-        
+        words_for_chunk = min(chunk_size * words_per_page, total_words_needed - current_words)
+        if words_for_chunk <= 0:
+            break
+            
         if i == 0:
             prompt = (
                 f"Напиши начало {doc_type} на тему: '{topic}'. "
-                f"Объем: примерно {current_words} слов. "
+                f"Объем: примерно {words_for_chunk} слов (это {chunk_size} страниц). "
                 "Пиши связным академическим текстом, без заголовков и списков, как сплошной текст. "
-                "Раскрой актуальность, основные понятия и начни анализ темы."
+                "Раскрой актуальность и основные понятия."
             )
         elif i == chunks - 1:
             prompt = (
                 f"Заверши {doc_type} на тему: '{topic}'. "
-                f"Объем: примерно {current_words} слов. "
-                "Пиши связным академическим текстом, без заголовков и списков. "
-                "Сделай выводы и заключение."
+                f"Объем: примерно {words_for_chunk} слов (это последние страницы). "
+                "Пиши связным академическим текстом. Сделай выводы и заключение."
             )
         else:
             prompt = (
                 f"Продолжи {doc_type} на тему: '{topic}'. "
-                f"Объем: примерно {current_words} слов. "
+                f"Объем: примерно {words_for_chunk} слов. "
                 "Пиши связным академическим текстом, без заголовков и списков. "
                 "Продолжи анализ темы, раскрой детали."
             )
         
         part = ask_groq_text([{"role": "user", "content": prompt}])
+        
         if part and "⚠️" not in part and "I'm sorry" not in part:
+            part_words = len(part.split())
             full_text += part + "\n\n"
+            current_words += part_words
+            logger.info(f"Кусок {i+1}/{chunks}: получено {part_words} слов. Всего: {current_words}/{total_words_needed}")
         else:
-            # Заглушка, если ИИ отказал
-            full_text += f"Текст по теме '{topic}' (часть {i+1}). " * 50 + "\n\n"
+            logger.warning(f"Кусок {i+1}/{chunks}: ИИ отказался, ставлю заглушку.")
+            stub = f"Текст по теме '{topic}'. " * 100
+            full_text += stub + "\n\n"
+            current_words += len(stub.split())
+    
+    if current_words < total_words_needed:
+        logger.warning(f"Текста не хватило ({current_words} из {total_words_needed}). Добиваю...")
+        stub = f"Дополнительный текст по теме '{topic}'. " * 100
+        full_text += stub + "\n\n"
     
     full_text = re.sub(r'[*#_`~]', '', full_text)
     full_text = "".join(c for c in full_text if c.isprintable() or c in '\n\r\t')
@@ -522,7 +537,7 @@ def create_text_document(pages: int, topic: str, doc_type: str, student_name: st
             section.top_margin = Cm(2)
             section.bottom_margin = Cm(2)
 
-        # Титульник (упрощенный)
+        # Титульник (если есть ФИО)
         if student_name:
             p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             run = p.add_run("МИНИСТЕРСТВО ОБРАЗОВАНИЯ И НАУКИ\nРОССИЙСКОЙ ФЕДЕРАЦИИ"); run.bold = True
@@ -759,7 +774,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             topic = parts[1]
             doc_type = parts[2]
             
-            # Если есть дополнительные данные для титульника
             student_name = parts[3] if len(parts) > 3 else ""
             group = parts[4] if len(parts) > 4 else ""
             discipline = parts[5] if len(parts) > 5 else ""
