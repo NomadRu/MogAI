@@ -219,38 +219,28 @@ def ask_mistral_vision(image_b64: str, user_text: str) -> str:
         return f"⚠️ Сбой Mistral (фото): {e}"
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ WORD ---
-def add_page_number(paragraph):
-    """Добавляет номер страницы в параграф"""
+def add_internal_link(paragraph, bookmark_name: str, link_text: str):
+    hyperlink = OxmlElement('w:hyperlink')
+    hyperlink.set(qn('w:anchor'), bookmark_name)
+    r = OxmlElement('w:r')
+    t = OxmlElement('w:t')
+    t.text = link_text
+    r.append(t)
+    hyperlink.append(r)
+    paragraph._p.append(hyperlink)
+
+def add_bookmark(paragraph, bookmark_name: str):
     run = paragraph.add_run()
-    fldChar1 = OxmlElement('w:fldChar')
-    fldChar1.set(qn('w:fldCharType'), 'begin')
-    instrText = OxmlElement('w:instrText')
-    instrText.set(qn('xml:space'), 'preserve')
-    instrText.text = "PAGE"
-    fldChar2 = OxmlElement('w:fldChar')
-    fldChar2.set(qn('w:fldCharType'), 'end')
-    run._r.append(fldChar1)
-    run._r.append(instrText)
-    run._r.append(fldChar2)
+    tag = run._r
+    start = OxmlElement('w:bookmarkStart')
+    start.set(qn('w:id'), str(hash(bookmark_name) % 100000))
+    start.set(qn('w:name'), bookmark_name)
+    tag.append(start)
+    end = OxmlElement('w:bookmarkEnd')
+    end.set(qn('w:id'), str(hash(bookmark_name) % 100000))
+    tag.append(end)
 
-def add_page_numbers_to_doc(doc):
-    """Добавляет нумерацию страниц в нижний колонтитул (кроме первой страницы)"""
-    for section in doc.sections:
-        # Разные колонтитулы для первой и остальных страниц
-        section.different_first_page_header_footer = True
-        
-        # Нижний колонтитул для обычных страниц
-        footer = section.footer
-        p = footer.paragraphs[0]
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        
-        # Добавляем текст "Страница " (опционально)
-        # run = p.add_run("Страница ")
-        # run.font.size = Pt(12)
-        
-        # Добавляем номер страницы
-        add_page_number(p)
-
+# --- СОЗДАНИЕ РЕФЕРАТА ---
 def create_word_document(pages: int, topic: str, student_name: str, group: str, discipline: str, teacher: str, city: str) -> io.BytesIO:
     words_needed = pages * 300
     
@@ -271,7 +261,6 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
     )
     raw_text = ask_groq_text([{"role": "user", "content": prompt}])
     
-    # Если ИИ отказался или ошибся, ставим заглушку
     if not raw_text or "⚠️" in raw_text or "I'm sorry" in raw_text: 
         raw_text = (
             f"ВВЕДЕНИЕ\n"
@@ -400,12 +389,8 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
             p.paragraph_format.first_line_indent = Cm(0)
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
             
-            # Создаем закладку (bookmark)
             run = p.add_run(title)
-            
-            # Добавляем табуляцию и точки
             p.add_run("\t")
-            # Настраиваем табуляцию, чтобы точки были ровно
             pPr = p._p.get_or_add_pPr()
             tabs = pPr.get_or_add_tabs()
             tab = tabs.add_tab()
@@ -466,9 +451,6 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
             add_paragraph("8. Козлов С.П. Анализ данных. М.: Наука, 2021. 190 с.")
             add_paragraph("9. Новикова Е.А. Современные технологии. СПб.: Питер, 2022. 240 с.")
             add_paragraph("10. Морозов В.В. Заключительные выводы. М.: Юрайт, 2023. 160 с.")
-
-        # --- ДОБАВЛЯЕМ НОМЕРА СТРАНИЦ ---
-        add_page_numbers_to_doc(doc)
 
         buf = io.BytesIO()
         doc.save(buf)
