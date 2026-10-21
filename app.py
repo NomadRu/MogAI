@@ -36,10 +36,11 @@ MISTRAL_KEY = os.environ.get("MISTRAL_API_KEY")
 if not TOKEN or not GROQ_KEY:
     raise ValueError("Не заданы TELEGRAM_TOKEN или GROQ_API_KEY!")
 
+# --- МОДЕЛИ ---
 GROQ_TEXT_MODELS = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "openai/gpt-oss-20b"]
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-# Обновили модель на актуальную (Pixtral устарел)
+# Модель Mistral для фото
 MISTRAL_VISION_MODEL = "ministral-3-14b-25-12" 
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 
@@ -60,20 +61,6 @@ def get_reset_keyboard():
 def get_stop_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Остановить", callback_data="stop_thinking")]])
 
-# --- РЕНДЕР ФОРМУЛ В КАРТИНКИ ---
-def render_latex_to_base64(latex: str) -> str:
-    if not HAS_MATPLOTLIB: return ""
-    try:
-        latex = latex.strip()
-        if not latex: return ""
-        fig = plt.figure(figsize=(0.01, 0.01))
-        fig.text(0, 0, f"${latex}$", fontsize=14, color='black')
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0.1, dpi=150, transparent=False, facecolor='white')
-        buf.seek(0); plt.close(fig)
-        return base64.b64encode(buf.read()).decode('utf-8')
-    except Exception: return ""
-
 # --- ПАРСЕР ТАБЛИЦ В PNG ---
 def markdown_to_png(text: str) -> io.BytesIO:
     if not HAS_MATPLOTLIB: return None
@@ -88,22 +75,27 @@ def markdown_to_png(text: str) -> io.BytesIO:
                 parts = [part.strip() for part in clean_line.strip('|').split('|')]
                 if all(re.match(r'^:?-+:?$', p) for p in parts if p): continue
                 if any(p for p in parts): table_data.append(parts)
+                
         if len(table_data) < 2: return None
         for row in table_data:
             for i in range(len(row)):
                 row[i] = row[i].replace('**', '').replace('*', '')
+
         max_cols = max(len(row) for row in table_data)
         for row in table_data:
             while len(row) < max_cols: row.append("")
+            
         fig, ax = plt.subplots(figsize=(14, max(2, len(table_data) * 0.8)))
         ax.axis('tight'); ax.axis('off')
         table = ax.table(cellText=table_data[1:], colLabels=table_data[0], cellLoc='left', loc='center')
         table.auto_set_font_size(False); table.set_fontsize(8); table.scale(1, 2.5)
+        
         for (row, col), cell in table.get_celld().items():
             cell.set_text_props(wrap=True)
             if row == 0:
                 cell.set_text_props(weight='bold', color='white'); cell.set_facecolor('#4a4a4a')
             else: cell.set_facecolor('#f0f0f0' if row % 2 == 0 else 'white')
+                
         buf = io.BytesIO()
         plt.savefig(buf, format='png', bbox_inches='tight', dpi=200)
         buf.seek(0); plt.close(fig)
@@ -161,11 +153,7 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- ЗАПРОСЫ К GROQ (ТЕКСТ) ---
 def ask_groq_text(messages: list) -> str:
-    system_prompt = (
-        "Ты — MogAI, полезный ассистент. Отвечай текстом. "
-        "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать таблицы (символ '|') без прямой просьбы пользователя. "
-        "Если пользователь явно попросил 'таблицу', используй только формат Markdown (| и -)."
-    )
+    system_prompt = "Ты — MogAI. Отвечай обычным текстом. Таблицы используй только по прямой просьбе."
     or_messages = [{"role": "system", "content": system_prompt}]
     for msg in messages[-8:]:
         or_messages.append({"role": msg["role"], "content": msg["content"]})
@@ -190,10 +178,7 @@ def ask_mistral_vision(image_b64: str, user_text: str) -> str:
 
     prompt = (
         f"Пользователь прислал фото. Вопрос: '{user_text or 'реши задачи'}'.\n\n"
-        "Если на фото есть математическая задача (уравнения, матрицы, примеры), реши ВСЕ задачи на фото, без исключений. "
-        "Не пиши фразы вроде 'для остальных примеров...'. Доводи каждое решение до конца. "
-        "ОБЯЗАТЕЛЬНО используй LaTeX для формул: пиши математику строго внутри \\( ... \\) для строчных или \\[ ... \\] для блочных. "
-        "НЕ используй HTML-теги <br> внутри формул LaTeX.\n\n"
+        "Если на фото есть математическая задача, реши ВСЕ задачи на фото. "
         "Если на фото НЕТ задачи, просто опиши, что на фото, в 2-3 предложениях. Начни ответ со слова 'ОПИСАНИЕ:'."
     )
 
@@ -208,7 +193,7 @@ def ask_mistral_vision(image_b64: str, user_text: str) -> str:
     ]
 
     try:
-        # Увеличили таймаут до 120 секунд для сложных фото
+        # Таймаут 120 секунд, чтобы Mistral успел
         response = requests.post(
             url=MISTRAL_API_URL,
             headers={"Authorization": f"Bearer {MISTRAL_KEY}", "Content-Type": "application/json"},
@@ -219,7 +204,7 @@ def ask_mistral_vision(image_b64: str, user_text: str) -> str:
         if "error" in data: return f"⚠️ Ошибка Mistral (фото): {data['error'].get('message')}"
         return data["choices"][0]["message"]["content"]
     except requests.exceptions.Timeout:
-        return "⚠️ Mistral думал слишком долго (больше 2 минут). Попробуйте сфотографировать меньший участок или подождите."
+        return "⚠️ Mistral думал слишком долго. Попробуйте сфотографировать меньший участок."
     except Exception as e: 
         return f"⚠️ Сбой Mistral (фото): {e}"
 
@@ -401,23 +386,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data["history"] = history[-8:]
                 return
 
-            clean_ai_response = ai_response.replace('<br>', '\n')
-            
-            def replace_formula(match):
-                formula = match.group(1) or match.group(2) or match.group(3)
-                if not formula: return match.group(0)
-                img_b64 = render_latex_to_base64(formula)
-                if img_b64:
-                    return f'<img src="data:image/png;base64,{img_b64}" style="vertical-align: middle; max-width: 100%;" alt="{formula}">'
-                return match.group(0)
-            
-            clean_ai_response = re.sub(
-                r'\\\((.*?)\\\)|\\\[(.*?)\\\]|\$(.*?)\$',
-                replace_formula,
-                clean_ai_response,
-                flags=re.DOTALL
-            )
-            clean_ai_response = clean_ai_response.replace('\n', '<br>')
+            # Простой HTML без формул
+            clean_ai_response = ai_response.replace('\n', '<br>')
 
             html_content = f"""<!DOCTYPE html>
 <html lang="ru">
@@ -428,7 +398,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.8; padding: 20px; max-width: 900px; margin: 0 auto; background-color: #f4f4f9; color: #333; }}
         h1 {{ color: #2c3e50; text-align: center; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
         .solution {{ background: white; padding: 25px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); font-size: 18px; }}
-        img {{ max-width: 100%; height: auto; }}
         .footer {{ text-align: center; margin-top: 20px; font-size: 12px; color: #7f8c8d; }}
     </style>
 </head>
@@ -443,7 +412,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             file_stream = io.BytesIO(html_content.encode('utf-8'))
             file_stream.name = "Reshenie.html"
-            await update.message.reply_document(document=file_stream, caption="📄 Вот HTML-файл с решением! Формулы встроены как картинки.")
+            await update.message.reply_document(document=file_stream, caption="📄 Вот HTML-файл с решением!")
             
             history = context.user_data.get("history", [])
             history.append({"role": "user", "content": f"[Фото задачи] {caption}"})
