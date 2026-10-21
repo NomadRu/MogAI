@@ -9,8 +9,9 @@ import time
 import traceback
 from docx import Document
 from docx.shared import Pt, Cm, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING, WD_TAB_ALIGNMENT, WD_TAB_LEADER
-from docx.enum.section import WD_ORIENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
 
 try:
     import matplotlib
@@ -40,7 +41,6 @@ if not TOKEN or not GROQ_KEY:
 # --- МОДЕЛИ ---
 GROQ_TEXT_MODELS = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "openai/gpt-oss-20b"]
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-
 MISTRAL_VISION_MODEL = "pixtral-12b-2409"
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 
@@ -211,32 +211,55 @@ def ask_mistral_vision(image_b64: str, user_text: str) -> str:
     except Exception as e: 
         return f"⚠️ Сбой Mistral (фото): {e}"
 
-# --- СОЗДАНИЕ РЕФЕРАТА ПО ГОСТ (ОБНОВЛЕННАЯ) ---
-def create_word_document(pages: int, topic: str) -> io.BytesIO:
-    # 1. Просим ИИ написать текст
-    # Считаем, что 1 страница ≈ 300 слов (с учетом 1.5 интервала и 14 шрифта)
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ WORD ---
+def add_bookmark(paragraph, bookmark_name: str):
+    """Создает закладку в параграфе для гиперссылки"""
+    run = paragraph.add_run()
+    tag = run._r
+    start = OxmlElement('w:bookmarkStart')
+    start.set(qn('w:id'), str(hash(bookmark_name) % 100000))
+    start.set(qn('w:name'), bookmark_name)
+    tag.append(start)
+    end = OxmlElement('w:bookmarkEnd')
+    end.set(qn('w:id'), str(hash(bookmark_name) % 100000))
+    tag.append(end)
+
+def add_internal_link(paragraph, bookmark_name: str, link_text: str):
+    """Создает кликабельную ссылку на закладку"""
+    hyperlink = OxmlElement('w:hyperlink')
+    hyperlink.set(qn('w:anchor'), bookmark_name)
+    r = OxmlElement('w:r')
+    t = OxmlElement('w:t')
+    t.text = link_text
+    r.append(t)
+    hyperlink.append(r)
+    paragraph._p.append(hyperlink)
+
+# --- СОЗДАНИЕ РЕФЕРАТА (ОБНОВЛЕННАЯ ВЕРСИЯ) ---
+def create_word_document(pages: int, topic: str, student_name: str, group: str, discipline: str, teacher: str, city: str) -> io.BytesIO:
     words_needed = pages * 300
+    
+    # Просим ИИ написать текст с "мнением автора"
     prompt = (
         f"Напиши текст для реферата на тему: '{topic}'. "
         f"Объем: примерно {words_needed} слов. "
-        "Структура строго по ГОСТ: Введение (актуальность, цель, задачи), "
+        "Структура: Введение (актуальность, цель, задачи), "
         "Основная часть (3 главы, в каждой 2 подглавы), Заключение, Список литературы. "
-        "Пиши академическим языком. Не используй Markdown. "
-        "Заголовки пиши с новой строки и выделяй их ЗАГЛАВНЫМИ буквами. "
+        "Пиши академическим языком, но от первого лица (как студент). "
+        "В КОНЦЕ КАЖДОЙ ПОДГЛАВЫ (после текста) добавь абзац, который начинается со слов 'Мнение автора:' и напиши 2-3 предложения своего отношения к теме. "
+        "Не используй Markdown. Заголовки пиши с новой строки ЗАГЛАВНЫМИ буквами. "
         "Подзаголовки пиши с новой строки, начиная с номера (например, 1.1 Название)."
     )
     raw_text = ask_groq_text([{"role": "user", "content": prompt}])
     if not raw_text or "⚠️" in raw_text: return None
 
-    # Очистка от возможных артефактов
     raw_text = re.sub(r'[*#_`~]', '', raw_text)
     raw_text = "".join(c for c in raw_text if c.isprintable() or c in '\n\r\t')
 
-    # 2. Собираем Word по ГОСТ
     try:
         doc = Document()
         
-        # Настройка стилей по ГОСТ
+        # Стили по ГОСТ
         style = doc.styles['Normal']
         style.font.name = 'Times New Roman'
         style.font.size = Pt(14)
@@ -246,14 +269,12 @@ def create_word_document(pages: int, topic: str) -> io.BytesIO:
         style.paragraph_format.first_line_indent = Cm(1.25)
         style.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
 
-        # Поля по ГОСТ (левое 3 см, правое 1.5 см, верхнее/нижнее 2 см)
         for section in doc.sections:
             section.left_margin = Cm(3)
             section.right_margin = Cm(1.5)
             section.top_margin = Cm(2)
             section.bottom_margin = Cm(2)
 
-        # Функция добавления абзаца
         def add_paragraph(text, is_heading=False, is_center=False, is_bold=False):
             p = doc.add_paragraph()
             p.paragraph_format.line_spacing_rule = WD_LINE_SPACING.ONE_POINT_FIVE
@@ -271,115 +292,111 @@ def create_word_document(pages: int, topic: str) -> io.BytesIO:
             return p
 
         # --- ТИТУЛЬНЫЙ ЛИСТ ---
-        # Верхний блок (Вуз)
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = p.add_run("МИНИСТЕРСТВО ОБРАЗОВАНИЯ И НАУКИ РФ"); run.bold = True
+        
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = p.add_run("НАЗВАНИЕ ВАШЕГО УЧЕБНОГО ЗАВЕДЕНИЯ"); run.bold = True
         
-        # Отступы
         for _ in range(4): doc.add_paragraph()
         
-        # Центральный блок (РЕФЕРАТ и тема)
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.add_run("РЕФЕРАТ").bold = True
         p.runs[0].font.size = Pt(24)
         
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p.add_run(f"по теме: «{topic}»").bold = True
+        p.add_run(f"по дисциплине: «{discipline}»").bold = True
+        p.runs[0].font.size = Pt(16)
+        
+        p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.add_run(f"на тему: «{topic}»").bold = True
         p.runs[0].font.size = Pt(18)
         
-        # Отступы
         for _ in range(6): doc.add_paragraph()
         
-        # Правый блок (Выполнил/Проверил)
+        # Блок исполнителя (справа)
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        p.add_run("Выполнил: студент\nГруппы: ______\nФИО: ______________")
+        p.add_run(f"Выполнил: студент группы {group}\n{student_name}")
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        p.add_run("Проверил: ______________")
+        p.add_run(f"Проверил: {teacher}")
         
-        # Отступы
         for _ in range(8): doc.add_paragraph()
         
-        # Нижний блок (Город, год)
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p.add_run("Город, 2026 г.")
+        p.add_run(f"{city}, 2026 г.")
         
-        doc.add_page_break() # Конец титульника
+        doc.add_page_break()
 
-        # --- СОДЕРЖАНИЕ (ОГЛАВЛЕНИЕ) ---
+        # --- ОГЛАВЛЕНИЕ (КЛИКАБЕЛЬНОЕ) ---
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.add_run("СОДЕРЖАНИЕ").bold = True
         doc.add_paragraph()
         
-        # Создаем оглавление с табуляцией (как в примере)
+        # Список для оглавления (заголовки и их закладки)
         toc_items = [
-            ("ВВЕДЕНИЕ", "3"),
-            ("ГЛАВА 1.", "4"),
-            ("1.1.", "4"),
-            ("1.2.", "5"),
-            ("ГЛАВА 2.", "6"),
-            ("2.1.", "6"),
-            ("2.2.", "7"),
-            ("ГЛАВА 3.", "8"),
-            ("3.1.", "8"),
-            ("3.2.", "9"),
-            ("ЗАКЛЮЧЕНИЕ", "10"),
-            ("СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ", "11")
+            ("ВВЕДЕНИЕ", "bookmark_intro"),
+            ("ГЛАВА 1.", "bookmark_ch1"),
+            ("1.1.", "bookmark_ch1_1"),
+            ("1.2.", "bookmark_ch1_2"),
+            ("ГЛАВА 2.", "bookmark_ch2"),
+            ("2.1.", "bookmark_ch2_1"),
+            ("2.2.", "bookmark_ch2_2"),
+            ("ГЛАВА 3.", "bookmark_ch3"),
+            ("3.1.", "bookmark_ch3_1"),
+            ("3.2.", "bookmark_ch3_2"),
+            ("ЗАКЛЮЧЕНИЕ", "bookmark_conclusion"),
+            ("СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ", "bookmark_refs")
         ]
         
-        for title, page in toc_items:
+        for title, bookmark in toc_items:
             p = doc.add_paragraph()
             p.paragraph_format.line_spacing_rule = WD_LINE_SPACING.ONE_POINT_FIVE
             p.paragraph_format.first_line_indent = Cm(0)
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
             
-            # Добавляем табуляцию с точками
-            run = p.add_run(title)
-            run.font.size = Pt(14)
+            # Добавляем кликабельную ссылку
+            add_internal_link(p, bookmark, title)
             
-            # Добавляем табуляцию
+            # Добавляем отступ (табуляцию) для красоты
             p.add_run("\t")
-            
-            # Добавляем номер страницы
-            run = p.add_run(page)
-            run.font.size = Pt(14)
-            
-            # Настраиваем табуляцию для точек (через XML)
-            pPr = p._p.get_or_add_pPr()
-            tabs = pPr.get_or_add_tabs()
-            tab = tabs.add_tab()
-            tab.pos = Cm(15) # Позиция табуляции
-            tab.alignment = WD_TAB_ALIGNMENT.RIGHT
-            tab.leader = WD_TAB_LEADER.DOTS
+            p.add_run("...")
         
         doc.add_page_break()
 
-        # --- ОСНОВНОЙ ТЕКСТ ---
+        # --- ОСНОВНОЙ ТЕКСТ (с закладками) ---
         lines = raw_text.split('\n')
+        current_bookmark = "bookmark_intro"  # Начинаем с введения
+        
         for line in lines:
             line = line.strip()
             if not line: continue
             
-            # Если строка похожа на заголовок (короткая, заглавные буквы)
-            if len(line) < 60 and (line.isupper() or line.startswith("ГЛАВА") or line.startswith("ВВЕДЕНИЕ") or line.startswith("ЗАКЛЮЧЕНИЕ")):
-                add_paragraph(line, is_heading=True)
-                doc.add_paragraph() # Пустая строка после заголовка
-            # Если строка похожа на подзаголовок (начинается с цифры)
-            elif re.match(r'^\d+\.\d+', line) and len(line) < 100:
-                add_paragraph(line, is_heading=False, is_bold=True)
+            # Проверяем, не заголовок ли это
+            is_heading = len(line) < 60 and (line.isupper() or line.startswith("ГЛАВА") or line.startswith("ВВЕДЕНИЕ") or line.startswith("ЗАКЛЮЧЕНИЕ"))
+            is_subheading = re.match(r'^\d+\.\d+', line) and len(line) < 100
+            
+            if is_heading:
+                p = add_paragraph(line, is_heading=True)
+                # Ставим закладку
+                bookmark_name = f"bookmark_{line[:10].replace(' ', '_').replace('.', '_')}"
+                add_bookmark(p, bookmark_name)
+                doc.add_paragraph()
+            elif is_subheading:
+                p = add_paragraph(line, is_heading=False, is_bold=True)
+                bookmark_name = f"bookmark_{line[:10].replace(' ', '_').replace('.', '_')}"
+                add_bookmark(p, bookmark_name)
                 doc.add_paragraph()
             else:
                 add_paragraph(line)
 
-        # --- СПИСОК ЛИТЕРАТУРЫ (Заглушка, если ИИ не написал) ---
-        if "СПИСОК" not in raw_text.upper():
-            doc.add_page_break()
-            add_paragraph("СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ", is_heading=True)
-            doc.add_paragraph()
-            add_paragraph("1. Иванов И.И. Основы теории. М.: Наука, 2020. 250 с.")
-            add_paragraph("2. Петров П.П. Практикум по дисциплине. СПб.: Питер, 2021. 180 с.")
-            add_paragraph("3. Сидоров С.С. Современные аспекты. М.: Юрайт, 2022. 300 с.")
+        # --- СПИСОК ЛИТЕРАТУРЫ ---
+        doc.add_page_break()
+        p = add_paragraph("СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ", is_heading=True)
+        add_bookmark(p, "bookmark_refs")
+        doc.add_paragraph()
+        add_paragraph("1. Иванов И.И. Основы теории. М.: Наука, 2020. 250 с.")
+        add_paragraph("2. Петров П.П. Практикум по дисциплине. СПб.: Питер, 2021. 180 с.")
+        add_paragraph("3. Сидоров С.С. Современные аспекты. М.: Юрайт, 2022. 300 с.")
 
         buf = io.BytesIO()
         doc.save(buf)
@@ -434,18 +451,19 @@ async def photo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["waiting_for_photo_prompt"] = True
     text = (
         "🎨 <b>Режим генерации фото.</b>\n\n"
-        "Напиши, что хочешь нарисовать (например: <i>кот в космосе, неоновый город, дракон</i>).\n\n"
-        "Контекст чата не сбросится, я просто нарисую картинку."
+        "Напиши, что хочешь нарисовать (например: <i>кот в космосе, неоновый город, дракон</i>)."
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
 async def word_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["waiting_for_word_prompt"] = True
+    context.user_data["waiting_for_word_data"] = True
     text = (
-        "📝 <b>Режим создания реферата по ГОСТу.</b>\n\n"
-        "Введи данные в формате: <b>количество страниц, тема</b>\n"
-        "Например: <i>15, История искусственного интеллекта</i>\n\n"
-        "Максимум 20 страниц. Я создам титульник, оглавление, введение, 3 главы с подглавами, заключение и список литературы."
+        "📝 <b>Создание реферата по ГОСТу.</b>\n\n"
+        "Отправь данные <b>одним сообщением</b> через запятую в таком порядке:\n"
+        "<b>Страницы, Тема, ФИО, Группа, Дисциплина, Преподаватель, Город</b>\n\n"
+        "Пример:\n"
+        "<i>15, История ИИ, Иванов И.И., ИВТ-21, Информатика, Петров П.П., Москва</i>\n\n"
+        "Максимум 20 страниц."
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
@@ -489,16 +507,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # 2. Ждем данные для /word
-        if context.user_data.get("waiting_for_word_prompt"):
-            context.user_data["waiting_for_word_prompt"] = False
+        if context.user_data.get("waiting_for_word_data"):
+            context.user_data["waiting_for_word_data"] = False
             
-            match = re.match(r'(\d+)\s*,\s*(.+)', user_text)
-            if not match:
-                await update.message.reply_text("⚠️ Неверный формат. Напиши: <b>15, Тема</b>", parse_mode="HTML")
+            parts = [p.strip() for p in user_text.split(',')]
+            if len(parts) < 7:
+                await update.message.reply_text("⚠️ Нужно 7 параметров через запятую. Попробуй еще раз: /word", parse_mode="HTML")
                 return
             
-            pages = int(match.group(1))
-            topic = match.group(2).strip()
+            try:
+                pages = int(parts[0])
+            except:
+                pages = 15
+            
+            topic = parts[1]
+            student_name = parts[2]
+            group = parts[3]
+            discipline = parts[4]
+            teacher = parts[5]
+            city = parts[6]
             
             if pages > 20:
                 pages = 20
@@ -508,7 +535,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             try:
                 await update.message.chat.send_action(action="upload_document")
-                docx_buffer = await asyncio.to_thread(create_word_document, pages, topic)
+                docx_buffer = await asyncio.to_thread(
+                    create_word_document, pages, topic, student_name, group, discipline, teacher, city
+                )
                 
                 if stop_event.is_set(): return
                 
@@ -516,7 +545,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_document(
                         document=docx_buffer, 
                         filename=f"Referat_{topic[:15]}.docx", 
-                        caption=f"📝 Реферат по ГОСТу: <b>{topic}</b> ({pages} стр.)"
+                        caption=f"📝 Реферат по ГОСТу: <b>{topic}</b> ({pages} стр.)\n"
+                                f"Студент: {student_name}\n"
+                                f"Группа: {group}\n"
+                                f"Дисциплина: {discipline}"
                     )
                 else:
                     await update.message.reply_text("⚠️ Не удалось создать реферат. Попробуйте позже.")
