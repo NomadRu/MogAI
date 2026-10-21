@@ -31,7 +31,6 @@ logger = logging.getLogger(__name__)
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 URL = os.environ.get("RENDER_EXTERNAL_URL")
 GROQ_KEY = os.environ.get("GROQ_API_KEY")
-MISTRAL_KEY = os.environ.get("MISTRAL_API_KEY")
 
 if not TOKEN or not GROQ_KEY:
     raise ValueError("Не заданы TELEGRAM_TOKEN или GROQ_API_KEY!")
@@ -40,12 +39,8 @@ if not TOKEN or not GROQ_KEY:
 GROQ_TEXT_MODELS = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "openai/gpt-oss-20b"]
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-# Qwen 3.8 27B — специально для формул, схем и OCR (через Groq)
+# Qwen 3.8 27B — идеальна для формул, схем, OCR (через Groq)
 GROQ_VISION_MODEL = "qwen/qwen3.8-27b"
-
-# Запасная модель Mistral (устарела, но оставим как резерв)
-MISTRAL_VISION_MODEL = "pixtral-12b-2409"
-MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 
 # --- КЛАВИАТУРЫ ---
 def get_main_keyboard():
@@ -156,11 +151,7 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- ЗАПРОСЫ К GROQ (ТЕКСТ) ---
 def ask_groq_text(messages: list) -> str:
-    system_prompt = (
-        "Ты — MogAI, полезный ассистент. Отвечай текстом. "
-        "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать таблицы (символ '|') без прямой просьбы пользователя. "
-        "Если пользователь явно попросил 'таблицу', используй только формат Markdown (| и -)."
-    )
+    system_prompt = "Ты — MogAI. Отвечай текстом. Таблицы используй только по прямой просьбе."
     or_messages = [{"role": "system", "content": system_prompt}]
     for msg in messages[-8:]:
         or_messages.append({"role": msg["role"], "content": msg["content"]})
@@ -179,58 +170,37 @@ def ask_groq_text(messages: list) -> str:
         except Exception: continue
     return "⚠️ Ошибка Groq."
 
-# --- УМНЫЙ ЗАПРОС ДЛЯ ФОТО (Qwen -> Mistral) ---
+# --- ЗАПРОСЫ К QWEN (ФОТО) ---
 def ask_vision_model(image_b64: str, user_text: str) -> str:
-    # 1. Пробуем Qwen через Groq (лучший для формул и схем)
-    if GROQ_KEY:
-        try:
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_text or "Реши задачи на фото. Распиши пошагово, используя LaTeX для формул."},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
-                    ]
-                }
-            ]
-            response = requests.post(
-                url=GROQ_API_URL,
-                headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-                json={"model": GROQ_VISION_MODEL, "messages": messages, "max_tokens": 4000},
-                timeout=60
-            )
-            data = response.json()
-            if "error" not in data and "choices" in data:
-                return data["choices"][0]["message"]["content"]
-            logger.warning(f"Groq Vision упал: {data.get('error')}")
-        except Exception as e:
-            logger.warning(f"Сбой Groq Vision: {e}")
+    if not GROQ_KEY: return "⚠️ Для фото нужен GROQ_API_KEY."
 
-    # 2. Если Groq не смог, идем в Mistral (устаревшая, но как резерв)
-    if MISTRAL_KEY:
-        try:
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_text or "Реши задачи на фото."},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
-                    ]
-                }
+    # Если вопрос задан, просим ответить на него. Если нет — описать фото.
+    if user_text:
+        prompt = f"Пользователь прислал фото и спрашивает: '{user_text}'. Внимательно посмотри на фото и ответь на вопрос. Если на фото есть математика или схемы, используй LaTeX для формул."
+    else:
+        prompt = "Пользователь прислал фото. Подробно опиши, что на нем изображено. Начни ответ со слова 'ОПИСАНИЕ:'."
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
             ]
-            response = requests.post(
-                url=MISTRAL_API_URL,
-                headers={"Authorization": f"Bearer {MISTRAL_KEY}", "Content-Type": "application/json"},
-                json={"model": MISTRAL_VISION_MODEL, "messages": messages, "max_tokens": 4000},
-                timeout=60
-            )
-            data = response.json()
-            if "error" not in data and "choices" in data:
-                return data["choices"][0]["message"]["content"]
-        except Exception as e:
-            return f"⚠️ Сбой всех Vision-моделей: {e}"
-    
-    return "⚠️ Нет доступных ключей для фото."
+        }
+    ]
+
+    try:
+        response = requests.post(
+            url=GROQ_API_URL,
+            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+            json={"model": GROQ_VISION_MODEL, "messages": messages, "max_tokens": 4000},
+            timeout=60
+        )
+        data = response.json()
+        if "error" in data: return f"⚠️ Ошибка Qwen (фото): {data['error'].get('message')}"
+        return data["choices"][0]["message"]["content"]
+    except Exception as e: return f"⚠️ Сбой Qwen (фото): {e}"
 
 # --- СОЗДАНИЕ РЕФЕРАТА ---
 def create_gost_document(topic: str) -> io.BytesIO:
@@ -310,10 +280,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 <b>Привет! Я MogAI.</b>\n\n"
         "Я умею:\n"
         "💬 Отвечать на вопросы\n"
-        "📊 <b>Создавать таблицы</b> (по запросу)\n"
+        "📊 <b>Создавать таблицы</b>\n"
         "📝 <b>Писать рефераты по ГОСТу</b> (.docx)\n"
-        "🧮 <b>Решать задачи по фото</b> (пришлю HTML)\n\n"
-        "Напиши: <i>«напиши реферат на тему [тема]»</i> или пришли фото задачи с подписью «реши»."
+        "🧮 <b>Читать фото и отвечать на вопросы</b>\n\n"
+        "Пришли фото с вопросом (например, «реши») или просто опиши, что на нем."
     )
     await update.message.reply_text(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
@@ -336,7 +306,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["history"] = []
         await query.edit_message_text("🧹 Новый чат!", reply_markup=get_main_keyboard())
     elif query.data == "help":
-        text = "🤖 <b>Команды:</b>\n• /reset — сброс\n• «напиши реферат про...»\n• Пришли фото задачи (пришлю HTML)."
+        text = "🤖 <b>Команды:</b>\n• /reset — сброс\n• «напиши реферат про...»\n• Пришли фото с вопросом."
         await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -402,6 +372,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(ai_response)
                 return
 
+            # Если это просто описание (без вопроса)
             if ai_response.startswith("ОПИСАНИЕ:"):
                 clean_desc = ai_response.replace("ОПИСАНИЕ:", "").strip()
                 await update.message.reply_text(f"📸 {clean_desc}")
@@ -411,31 +382,33 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data["history"] = history[-8:]
                 return
 
-            # --- ОЧИСТКА ОТ ЛИШНИХ СИМВОЛОВ ---
-            clean_ai_response = ai_response.replace('<br>', '\n')
+            # Если пользователь задал вопрос (например, "реши"), то отвечаем текстом в чат
+            # Сначала чистим формулы от лишнего, чтобы они читались в тексте (хотя в Telegram они будут просто текстом)
+            clean_response = ai_response.replace('<br>', '\n')
             
-            def clean_block(match):
-                block = match.group(1)
-                block = block.replace('\\(', '').replace('\\)', '')
-                block = block.replace('\\[', '').replace('\\]', '')
-                return f"\\[{block}\\]"
-            
-            clean_ai_response = re.sub(r'\\\[(.*?)\\\]', clean_block, clean_ai_response, flags=re.DOTALL)
-            clean_ai_response = clean_ai_response.replace('\\\\', ' ')
+            # Если ответ очень длинный (например, решение 10 задач), отправим файлом
+            if len(clean_response) > 2000:
+                # Формируем HTML
+                def clean_block(match):
+                    block = match.group(1)
+                    block = block.replace('\\(', '').replace('\\)', '')
+                    block = block.replace('\\[', '').replace('\\]', '')
+                    return f"\\[{block}\\]"
+                clean_response = re.sub(r'\\\[(.*?)\\\]', clean_block, clean_response, flags=re.DOTALL)
+                clean_response = clean_response.replace('\\\\', ' ')
+                
+                lines = clean_response.split('\n')
+                new_lines = []
+                for line in lines:
+                    stripped = line.strip()
+                    if re.search(r'[=+\-^\\]', stripped) and not re.search(r'\$|\\\(|\\\[', stripped) and len(stripped) < 150:
+                        new_lines.append(f"\\({stripped}\\)")
+                    else:
+                        new_lines.append(line)
+                clean_response = '\n'.join(new_lines)
+                clean_response = clean_response.replace('\n', '<br>')
 
-            lines = clean_ai_response.split('\n')
-            new_lines = []
-            for line in lines:
-                stripped = line.strip()
-                if re.search(r'[=+\-^\\]', stripped) and not re.search(r'\$|\\\(|\\\[', stripped) and len(stripped) < 150:
-                    new_lines.append(f"\\({stripped}\\)")
-                else:
-                    new_lines.append(line)
-            clean_ai_response = '\n'.join(new_lines)
-
-            clean_ai_response = clean_ai_response.replace('\n', '<br>')
-
-            html_content = f"""<!DOCTYPE html>
+                html_content = f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
@@ -443,7 +416,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
     <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <style>
-        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.8; padding: 20px; max-width: 900px; margin: 0 auto; background-color: #f4f4f9; color: #333; }}
+        body {{ font-family: 'Segoe UI', sans-serif; line-height: 1.8; padding: 20px; max-width: 900px; margin: 0 auto; background-color: #f4f4f9; color: #333; }}
         h1 {{ color: #2c3e50; text-align: center; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
         .solution {{ background: white; padding: 25px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); font-size: 16px; }}
         .footer {{ text-align: center; margin-top: 20px; font-size: 12px; color: #7f8c8d; }}
@@ -452,19 +425,21 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 <body>
     <h1>📝 Решение задачи</h1>
     <div class="solution">
-        {clean_ai_response}
+        {clean_response}
     </div>
     <div class="footer">Сгенерировано MogAI</div>
 </body>
 </html>"""
+                file_stream = io.BytesIO(html_content.encode('utf-8'))
+                file_stream.name = "Reshenie.html"
+                await update.message.reply_document(document=file_stream, caption="📄 Ответ длинный. Открой файл, чтобы увидеть красивые формулы.")
+            else:
+                # Если ответ короткий, просто отправляем текстом
+                await update.message.reply_text(ai_response)
 
-            file_stream = io.BytesIO(html_content.encode('utf-8'))
-            file_stream.name = "Reshenie.html"
-            await update.message.reply_document(document=file_stream, caption="📄 Вот HTML-файл с решением! Открой его в браузере, чтобы увидеть красивые формулы.")
-            
             history = context.user_data.get("history", [])
-            history.append({"role": "user", "content": f"[Фото задачи] {caption}"})
-            history.append({"role": "assistant", "content": "Я решил задачу с фото. Вот решение:\n" + clean_ai_response})
+            history.append({"role": "user", "content": f"[Фото] {caption}"})
+            history.append({"role": "assistant", "content": ai_response})
             context.user_data["history"] = history[-8:]
             
         finally:
