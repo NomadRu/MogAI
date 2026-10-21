@@ -40,7 +40,6 @@ if not TOKEN or not GROQ_KEY:
 GROQ_TEXT_MODELS = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "openai/gpt-oss-20b"]
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-# Возвращаем Mistral для фото (она не упирается в лимиты)
 MISTRAL_VISION_MODEL = "pixtral-12b-2409"
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 
@@ -60,6 +59,14 @@ def get_reset_keyboard():
 
 def get_stop_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Остановить", callback_data="stop_thinking")]])
+
+# --- ГЕНЕРАЦИЯ ФОТО (POLLINATIONS) ---
+def generate_image(prompt: str) -> str:
+    """Генерирует картинку через Pollinations.ai"""
+    encoded_prompt = requests.utils.quote(prompt)
+    # Добавляем теги качества
+    full_prompt = f"{encoded_prompt}, high quality, detailed, masterpiece"
+    return f"https://image.pollinations.ai/prompt/{full_prompt}?width=1024&height=1024&nologo=true&seed={os.urandom(4).hex()}"
 
 # --- ПАРСЕР ТАБЛИЦ В PNG ---
 def markdown_to_png(text: str) -> io.BytesIO:
@@ -286,13 +293,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💬 Отвечать на вопросы\n"
         "📊 <b>Создавать таблицы</b>\n"
         "📝 <b>Писать рефераты по ГОСТу</b> (.docx)\n"
-        "🧮 <b>Читать фото и отвечать на вопросы</b>\n\n"
-        "Пришли фото с вопросом (например, «реши») или просто опиши, что на нем."
+        "🧮 <b>Читать фото и отвечать на вопросы</b>\n"
+        "🎨 <b>Генерировать картинки</b> (команда /photo)\n\n"
+        "Напиши что-нибудь или используй команды."
     )
     await update.message.reply_text(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⚠️ <b>Вы уверены?</b>", reply_markup=get_reset_keyboard(), parse_mode="HTML")
+
+async def photo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Устанавливаем флаг, что ждем промпт для фото
+    context.user_data["waiting_for_photo_prompt"] = True
+    await update.message.reply_text(
+        "🎨 <b>Режим генерации фото.</b>\n\n"
+        "Напиши, что хочешь нарисовать (например: <i>кот в космосе, неоновый город, дракон</i>).\n\n"
+        "Контекст чата не сбросится, я просто нарисую картинку."
+    )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -310,14 +327,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["history"] = []
         await query.edit_message_text("🧹 Новый чат!", reply_markup=get_main_keyboard())
     elif query.data == "help":
-        text = "🤖 <b>Команды:</b>\n• /reset — сброс\n• «напиши реферат про...»\n• Пришли фото с вопросом."
+        text = "🤖 <b>Команды:</b>\n• /reset — сброс\n• /photo — нарисовать картинку\n• «напиши реферат про...»\n• Пришли фото с вопросом."
         await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        user_text = update.message.text.lower()
+        user_text = update.message.text
         
-        if "реферат" in user_text or "доклад" in user_text:
+        # 1. Проверяем, ждем ли мы промпт для фото
+        if context.user_data.get("waiting_for_photo_prompt"):
+            context.user_data["waiting_for_photo_prompt"] = False # Сбрасываем флаг
+            
+            await update.message.chat.send_action(action="upload_photo")
+            image_url = generate_image(user_text)
+            
+            await update.message.reply_photo(
+                photo=image_url, 
+                caption=f"🎨 Вот что я нарисовал по запросу: <i>{user_text}</i>", 
+                parse_mode="HTML"
+            )
+            return # Выходим, чтобы не идти в обычный чат
+
+        # 2. Обычная логика текста
+        lower_text = user_text.lower()
+        
+        if "реферат" in lower_text or "доклад" in lower_text:
             match = re.search(r'(?:на тему|про)\s+(.+)', user_text)
             topic = match.group(1) if match else "Интересные факты"
             
@@ -341,7 +375,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         anim = asyncio.create_task(animate_thinking(update, stop_event))
         try:
             history = context.user_data.get("history", [])
-            history.append({"role": "user", "content": user_text})
+            history.append({"role": "user", "content": lower_text})
             if len(history) > 8: history = history[-8:]
             ai_response = await asyncio.to_thread(ask_groq_text, history)
             if stop_event.is_set(): return
@@ -376,7 +410,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(ai_response)
                 return
 
-            # Если это просто описание (без вопроса)
             if ai_response.startswith("ОПИСАНИЕ:"):
                 clean_desc = ai_response.replace("ОПИСАНИЕ:", "").strip()
                 await update.message.reply_text(f"📸 {clean_desc}")
@@ -386,10 +419,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data["history"] = history[-8:]
                 return
 
-            # Если пользователь задал вопрос (например, "реши"), то отвечаем текстом в чат
             clean_response = ai_response.replace('<br>', '\n')
             
-            # Если ответ очень длинный (например, решение 10 задач), отправим файлом
             if len(clean_response) > 2000:
                 def clean_block(match):
                     block = match.group(1)
@@ -436,7 +467,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 file_stream.name = "Reshenie.html"
                 await update.message.reply_document(document=file_stream, caption="📄 Ответ длинный. Открой файл, чтобы увидеть красивые формулы.")
             else:
-                # Если ответ короткий, просто отправляем текстом
                 await update.message.reply_text(ai_response)
 
             history = context.user_data.get("history", [])
@@ -455,6 +485,7 @@ if __name__ == "__main__":
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset_command))
+    app.add_handler(CommandHandler("photo", photo_command)) # Новая команда
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
