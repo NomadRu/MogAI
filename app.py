@@ -177,7 +177,6 @@ def ask_groq_text(messages: list) -> str:
 def ask_mistral_vision(image_b64: str, user_text: str) -> str:
     if not MISTRAL_KEY: return "⚠️ Для фото нужен MISTRAL_API_KEY."
 
-    # Если пользователь не просил решать, просим описать
     if user_text and "реши" in user_text.lower():
         prompt = (
             f"Пользователь прислал фото и просит: '{user_text}'.\n"
@@ -392,26 +391,34 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data["history"] = history[-8:]
                 return
 
-            # Если это решение, делаем HTML
+            # --- ОЧИСТКА ОТ ЛИШНИХ СИМВОЛОВ ---
             clean_ai_response = ai_response.replace('<br>', '\n')
             
-            # Автоматически оборачиваем формулы в \( ... \), если их пропустили
-            def wrap_formulas(text):
-                # Ищем строки, которые похожи на формулы, но не обернуты
-                lines = text.split('\n')
-                new_lines = []
-                for line in lines:
-                    stripped = line.strip()
-                    # Если строка содержит математику и не обернута, оборачиваем
-                    if re.search(r'[=+\-^\\]', stripped) and not re.search(r'\$|\\\(|\\\[', stripped) and len(stripped) < 150:
-                        new_lines.append(f"\\({stripped}\\)")
-                    else:
-                        new_lines.append(line)
-                return '\n'.join(new_lines)
+            # Убираем \( и \) внутри \[ ... \] (если есть)
+            # Ищем блоки \[ ... \] и чистим внутренности
+            def clean_block(match):
+                block = match.group(1)
+                block = block.replace('\\(', '').replace('\\)', '')
+                block = block.replace('\\[', '').replace('\\]', '')
+                return f"\\[{block}\\]"
+            
+            clean_ai_response = re.sub(r'\\\[(.*?)\\\]', clean_block, clean_ai_response, flags=re.DOTALL)
+            
+            # Убираем двойные слэши в конце строк (в матрицах) — заменяем на пробел или убираем
+            clean_ai_response = clean_ai_response.replace('\\\\', ' ')
 
-            clean_ai_response = wrap_formulas(clean_ai_response)
+            # --- ОБОРАЧИВАНИЕ ФОРМУЛ ---
+            # Ищем строки, которые похожи на формулы, но не обернуты
+            lines = clean_ai_response.split('\n')
+            new_lines = []
+            for line in lines:
+                stripped = line.strip()
+                if re.search(r'[=+\-^\\]', stripped) and not re.search(r'\$|\\\(|\\\[', stripped) and len(stripped) < 150:
+                    new_lines.append(f"\\({stripped}\\)")
+                else:
+                    new_lines.append(line)
+            clean_ai_response = '\n'.join(new_lines)
 
-            # Заменяем переносы на <br> для HTML
             clean_ai_response = clean_ai_response.replace('\n', '<br>')
 
             html_content = f"""<!DOCTYPE html>
