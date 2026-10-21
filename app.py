@@ -237,7 +237,7 @@ def add_bookmark(paragraph, bookmark_name: str):
     end.set(qn('w:id'), str(hash(bookmark_name) % 100000))
     tag.append(end)
 
-# --- СОЗДАНИЕ РЕФЕРАТА (ОБНОВЛЕННЫЙ) ---
+# --- СОЗДАНИЕ РЕФЕРАТА ---
 def create_word_document(pages: int, topic: str, student_name: str, group: str, discipline: str, teacher: str, city: str) -> io.BytesIO:
     words_needed = pages * 300
     
@@ -251,7 +251,7 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
         "НЕ пиши заголовок 'Мнение автора:', просто начни абзац с личного мнения. "
         "Не используй Markdown. Заголовки пиши с новой строки ЗАГЛАВНЫМИ буквами. "
         "Подзаголовки пиши с новой строки, начиная с номера (например, 1.1 Название). "
-        "В конце ОБЯЗАТЕЛЬНО сделай раздел 'СПИСОК ЛИТЕРАТУРЫ' с 5-7 источниками."
+        "В конце ОБЯЗАТЕЛЬНО сделай раздел 'СПИСОК ЛИТЕРАТУРЫ' с 10 источниками, изданными не позднее 2021 года."
     )
     raw_text = ask_groq_text([{"role": "user", "content": prompt}])
     if not raw_text or "⚠️" in raw_text or "I'm sorry" in raw_text: 
@@ -389,15 +389,22 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
             else:
                 add_paragraph(line)
 
-        # --- СПИСОК ЛИТЕРАТУРЫ ---
+        # --- СПИСОК ЛИТЕРАТУРЫ (10 ИСТОЧНИКОВ) ---
         if "СПИСОК ЛИТЕРАТУРЫ" not in raw_text.upper() and "СПИСОК ИСПОЛЬЗОВАННЫХ" not in raw_text.upper():
             doc.add_page_break()
             p = add_paragraph("СПИСОК ЛИТЕРАТУРЫ", is_heading=True)
             add_bookmark(p, "bookmark_refs")
             doc.add_paragraph()
-            add_paragraph("1. Иванов И.И. Основы теории. М.: Наука, 2020. 250 с.")
+            add_paragraph("1. Иванов И.И. Основы теории. М.: Наука, 2021. 250 с.")
             add_paragraph("2. Петров П.П. Практикум по дисциплине. СПб.: Питер, 2021. 180 с.")
             add_paragraph("3. Сидоров С.С. Современные аспекты. М.: Юрайт, 2022. 300 с.")
+            add_paragraph("4. Кузнецов А.В. Методология исследования. М.: Инфра-М, 2023. 210 с.")
+            add_paragraph("5. Смирнова О.В. Теоретические основы. СПб.: Лань, 2021. 320 с.")
+            add_paragraph("6. Попов Д.А. Практические рекомендации. М.: Проспект, 2022. 150 с.")
+            add_paragraph("7. Лебедев М.Н. История вопроса. М.: Академия, 2023. 280 с.")
+            add_paragraph("8. Козлов С.П. Анализ данных. М.: Наука, 2021. 190 с.")
+            add_paragraph("9. Новикова Е.А. Современные технологии. СПб.: Питер, 2022. 240 с.")
+            add_paragraph("10. Морозов В.В. Заключительные выводы. М.: Юрайт, 2023. 160 с.")
 
         buf = io.BytesIO()
         doc.save(buf)
