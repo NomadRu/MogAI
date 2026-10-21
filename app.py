@@ -63,7 +63,6 @@ def get_stop_keyboard():
 # --- ГЕНЕРАЦИЯ ФОТО (POLLINATIONS) ---
 def generate_image(prompt: str) -> str:
     encoded_prompt = requests.utils.quote(prompt)
-    # Принудительно ставим модель flux и убираем логотип
     return f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&model=flux&nologo=true&seed={os.urandom(4).hex()}"
 
 # --- ПАРСЕР ТАБЛИЦ В PNG ---
@@ -211,53 +210,148 @@ def ask_mistral_vision(image_b64: str, user_text: str) -> str:
     except Exception as e: 
         return f"⚠️ Сбой Mistral (фото): {e}"
 
-# --- СОЗДАНИЕ РЕФЕРАТА ---
-def create_gost_document(topic: str) -> io.BytesIO:
+# --- СОЗДАНИЕ РЕФЕРАТА ПО ГОСТ (КОМАНДА /word) ---
+def create_word_document(pages: int, topic: str) -> io.BytesIO:
+    # 1. Просим ИИ написать текст
+    # Считаем, что 1 страница ≈ 300 слов (с учетом 1.5 интервала и 14 шрифта)
+    words_needed = pages * 300
     prompt = (
         f"Напиши текст для реферата на тему: '{topic}'. "
-        "Структура: Введение, Основная часть, Заключение. Объем: 1000-1500 слов. "
-        "Пиши чистым текстом без Markdown. Заголовки пиши ЗАГЛАВНЫМИ буквами."
+        f"Объем: примерно {words_needed} слов. "
+        "Структура строго по ГОСТ: Введение (актуальность, цель, задачи), "
+        "Основная часть (3 главы, в каждой 2 подглавы), Заключение, Список литературы. "
+        "Пиши академическим языком. Не используй Markdown. "
+        "Заголовки пиши с новой строки и выделяй их ЗАГЛАВНЫМИ буквами."
     )
     raw_text = ask_groq_text([{"role": "user", "content": prompt}])
     if not raw_text or "⚠️" in raw_text: return None
 
+    # Очистка от возможных артефактов
     raw_text = re.sub(r'[*#_`~]', '', raw_text)
     raw_text = "".join(c for c in raw_text if c.isprintable() or c in '\n\r\t')
 
+    # 2. Собираем Word
     try:
         doc = Document()
+        
+        # Настройка стилей по ГОСТ (Times New Roman, 14, полуторный)
         style = doc.styles['Normal']
         style.font.name = 'Times New Roman'
         style.font.size = Pt(14)
+        style.paragraph_format.line_spacing_rule = WD_LINE_SPACING.ONE_POINT_FIVE
+        style.paragraph_format.space_after = Pt(0)
+        style.paragraph_format.space_before = Pt(0)
+
+        # Поля
         for section in doc.sections:
-            section.left_margin = Cm(3); section.right_margin = Cm(1.5)
-            section.top_margin = Cm(2); section.bottom_margin = Cm(2)
-            
-        def add_gost_paragraph(text, is_heading=False):
+            section.left_margin = Cm(3)
+            section.right_margin = Cm(1.5)
+            section.top_margin = Cm(2)
+            section.bottom_margin = Cm(2)
+
+        # Функция добавления абзаца
+        def add_paragraph(text, is_heading=False, is_center=False):
             p = doc.add_paragraph()
             p.paragraph_format.line_spacing_rule = WD_LINE_SPACING.ONE_POINT_FIVE
-            p.paragraph_format.first_line_indent = Cm(1.25)
-            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            p.paragraph_format.first_line_indent = Cm(1.25) if not is_center else Cm(0)
+            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY if not is_center else WD_ALIGN_PARAGRAPH.CENTER
+            
             if is_heading:
-                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                p.paragraph_format.first_line_indent = Cm(0)
-                run = p.add_run(text.upper()); run.bold = True
-            else: p.add_run(text)
+                run = p.add_run(text.upper())
+                run.bold = True
+            else:
+                p.add_run(text)
+            return p
 
-        doc.add_paragraph().add_run("РЕФЕРАТ").bold = True
-        doc.add_paragraph(f"на тему: «{topic}»")
-        doc.add_paragraph("\n\n\n\n\n\n\n\n\n\n")
+        # --- ТИТУЛЬНЫЙ ЛИСТ ---
+        # Верхний блок
+        p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = p.add_run("МИНИСТЕРСТВО ОБРАЗОВАНИЯ И НАУКИ РФ"); run.bold = True
         
-        for line in raw_text.split('\n'):
+        p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = p.add_run("НАЗВАНИЕ ВАШЕГО УЧЕБНОГО ЗАВЕДЕНИЯ"); run.bold = True
+        
+        doc.add_paragraph() # Пустая строка
+        
+        p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.add_run("РЕФЕРАТ").bold = True
+        p.runs[0].font.size = Pt(24)
+        
+        p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.add_run(f"по теме: «{topic}»").bold = True
+        p.runs[0].font.size = Pt(18)
+        
+        # Отступы вниз
+        for _ in range(8): doc.add_paragraph()
+        
+        # Правый блок (Выполнил/Проверил)
+        p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        p.add_run("Выполнил: студент\nГруппы: ______\nФИО: ______________")
+        p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        p.add_run("Проверил: ______________")
+        
+        for _ in range(8): doc.add_paragraph()
+        
+        # Нижний блок
+        p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.add_run("Город, 2026 г.")
+        
+        doc.add_page_break() # Конец титульника
+
+        # --- ОГЛАВЛЕНИЕ (СОДЕРЖАНИЕ) ---
+        p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.add_run("СОДЕРЖАНИЕ").bold = True
+        doc.add_paragraph()
+        
+        # Мы не будем делать автособираемое оглавление (сложно), 
+        # но добавим заглушку, чтобы структура была видна.
+        p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        p.add_run("ВВЕДЕНИЕ ........................................................................................................ 3\n")
+        p.add_run("ГЛАВА 1. ........................................................................................................ 4\n")
+        p.add_run("   1.1. ........................................................................................................ 4\n")
+        p.add_run("   1.2. ........................................................................................................ 5\n")
+        p.add_run("ГЛАВА 2. ........................................................................................................ 6\n")
+        p.add_run("   2.1. ........................................................................................................ 6\n")
+        p.add_run("   2.2. ........................................................................................................ 7\n")
+        p.add_run("ГЛАВА 3. ........................................................................................................ 8\n")
+        p.add_run("   3.1. ........................................................................................................ 8\n")
+        p.add_run("   3.2. ........................................................................................................ 9\n")
+        p.add_run("ЗАКЛЮЧЕНИЕ ................................................................................................ 10\n")
+        p.add_run("СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ ............................. 11\n")
+        
+        doc.add_page_break()
+
+        # --- ОСНОВНОЙ ТЕКСТ ---
+        # Разбиваем текст от ИИ на строки и вставляем
+        lines = raw_text.split('\n')
+        for line in lines:
             line = line.strip()
             if not line: continue
+            
+            # Если строка похожа на заголовок (короткая, заглавные буквы)
             if len(line) < 60 and (line.isupper() or line.endswith(':')):
-                add_gost_paragraph(line, is_heading=True); doc.add_paragraph()
-            else: add_gost_paragraph(line)
-                
-        buf = io.BytesIO(); doc.save(buf); buf.seek(0)
+                add_paragraph(line, is_heading=True)
+                doc.add_paragraph() # Пустая строка после заголовка
+            else:
+                add_paragraph(line)
+
+        # --- СПИСОК ЛИТЕРАТУРЫ (Заглушка, если ИИ не написал) ---
+        # Проверим, есть ли в конце "СПИСОК"
+        if "СПИСОК" not in raw_text.upper():
+            doc.add_page_break()
+            add_paragraph("СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ", is_heading=True)
+            doc.add_paragraph()
+            add_paragraph("1. Иванов И.И. Основы теории. М.: Наука, 2020. 250 с.")
+            add_paragraph("2. Петров П.П. Практикум по дисциплине. СПб.: Питер, 2021. 180 с.")
+            add_paragraph("3. Сидоров С.С. Современные аспекты. М.: Юрайт, 2022. 300 с.")
+
+        buf = io.BytesIO()
+        doc.save(buf)
+        buf.seek(0)
         return buf
-    except Exception: return None
+    except Exception as e:
+        logger.error(f"Ошибка сборки Word: {e}")
+        return None
 
 # --- ОТПРАВКА ---
 async def send_safe_message(update: Update, text: str):
@@ -290,7 +384,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Я умею:\n"
         "💬 Отвечать на вопросы\n"
         "📊 <b>Создавать таблицы</b>\n"
-        "📝 <b>Писать рефераты по ГОСТу</b> (.docx)\n"
+        "📝 <b>Писать рефераты по ГОСТу</b> (команда /word)\n"
         "🧮 <b>Читать фото и отвечать на вопросы</b>\n"
         "🎨 <b>Генерировать картинки</b> (команда /photo)\n\n"
         "Напиши что-нибудь или используй команды."
@@ -306,6 +400,16 @@ async def photo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎨 <b>Режим генерации фото.</b>\n\n"
         "Напиши, что хочешь нарисовать (например: <i>кот в космосе, неоновый город, дракон</i>).\n\n"
         "Контекст чата не сбросится, я просто нарисую картинку."
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
+
+async def word_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["waiting_for_word_prompt"] = True
+    text = (
+        "📝 <b>Режим создания реферата по ГОСТу.</b>\n\n"
+        "Введи данные в формате: <b>количество страниц, тема</b>\n"
+        "Например: <i>15, История искусственного интеллекта</i>\n\n"
+        "Максимум 20 страниц. Я создам титульник, оглавление, введение, 3 главы с подглавами, заключение и список литературы."
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
@@ -325,63 +429,69 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["history"] = []
         await query.edit_message_text("🧹 Новый чат!", reply_markup=get_main_keyboard())
     elif query.data == "help":
-        text = "🤖 <b>Команды:</b>\n• /reset — сброс\n• /photo — нарисовать картинку\n• «напиши реферат про...»\n• Пришли фото с вопросом."
+        text = "🤖 <b>Команды:</b>\n• /reset — сброс\n• /photo — нарисовать картинку\n• /word — создать реферат по ГОСТу\n• Пришли фото с вопросом."
         await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user_text = update.message.text
         
-        # 1. Проверяем, ждем ли мы промпт для фото
+        # 1. Ждем промпт для фото
         if context.user_data.get("waiting_for_photo_prompt"):
             context.user_data["waiting_for_photo_prompt"] = False
-            
             await update.message.chat.send_action(action="upload_photo")
             
-            # Переводим промпт на английский для лучшего качества
             translation_prompt = [
                 {"role": "system", "content": "You are a translator. Translate the following text to English for an image generator. Output ONLY the translation, no extra words."},
                 {"role": "user", "content": user_text}
             ]
             english_prompt = ask_groq_text(translation_prompt)
-            
-            if "⚠️" in english_prompt:
-                english_prompt = user_text
-            
-            logger.info(f"Оригинал: {user_text} | Перевод: {english_prompt}")
+            if "⚠️" in english_prompt: english_prompt = user_text
             
             image_url = generate_image(english_prompt)
-            
-            await update.message.reply_photo(
-                photo=image_url, 
-                caption=f"🎨 Вот что я нарисовал по запросу: <i>{user_text}</i>", 
-                parse_mode="HTML"
-            )
+            await update.message.reply_photo(photo=image_url, caption=f"🎨 Вот что я нарисовал: <i>{user_text}</i>", parse_mode="HTML")
             return
 
-        # 2. Обычная логика текста
-        lower_text = user_text.lower()
-        
-        if "реферат" in lower_text or "доклад" in lower_text:
-            match = re.search(r'(?:на тему|про)\s+(.+)', user_text)
-            topic = match.group(1) if match else "Интересные факты"
+        # 2. Ждем данные для /word
+        if context.user_data.get("waiting_for_word_prompt"):
+            context.user_data["waiting_for_word_prompt"] = False
+            
+            # Парсим "страницы, тема"
+            match = re.match(r'(\d+)\s*,\s*(.+)', user_text)
+            if not match:
+                await update.message.reply_text("⚠️ Неверный формат. Напиши: <b>15, Тема</b>", parse_mode="HTML")
+                return
+            
+            pages = int(match.group(1))
+            topic = match.group(2).strip()
+            
+            if pages > 20:
+                pages = 20 # Ограничение
             
             stop_event = asyncio.Event(); context.user_data["stop_event"] = stop_event
             anim = asyncio.create_task(animate_thinking(update, stop_event))
+            
             try:
                 await update.message.chat.send_action(action="upload_document")
-                docx_buffer = await asyncio.to_thread(create_gost_document, topic)
+                docx_buffer = await asyncio.to_thread(create_word_document, pages, topic)
+                
                 if stop_event.is_set(): return
+                
                 if docx_buffer:
                     await update.message.reply_document(
-                        document=docx_buffer, filename=f"Referat_{topic[:10]}.docx", 
-                        caption=f"📝 Реферат по ГОСТу: <b>{topic}</b>", parse_mode="HTML"
+                        document=docx_buffer, 
+                        filename=f"Referat_{topic[:15]}.docx", 
+                        caption=f"📝 Реферат по ГОСТу: <b>{topic}</b> ({pages} стр.)"
                     )
-                else: await update.message.reply_text("⚠️ Не удалось создать реферат.")
+                else:
+                    await update.message.reply_text("⚠️ Не удалось создать реферат. Попробуйте позже.")
             finally:
                 stop_event.set(); await anim
             return
 
+        # 3. Обычная логика текста
+        lower_text = user_text.lower()
+        
         stop_event = asyncio.Event(); context.user_data["stop_event"] = stop_event
         anim = asyncio.create_task(animate_thinking(update, stop_event))
         try:
@@ -497,6 +607,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CommandHandler("photo", photo_command))
+    app.add_handler(CommandHandler("word", word_command)) # Новая команда
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
