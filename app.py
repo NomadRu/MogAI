@@ -38,7 +38,9 @@ if not TOKEN or not GROQ_KEY:
 
 GROQ_TEXT_MODELS = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "openai/gpt-oss-20b"]
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-MISTRAL_VISION_MODEL = "pixtral-12b-2409"
+
+# Обновили модель на актуальную (Pixtral устарел)
+MISTRAL_VISION_MODEL = "ministral-3-14b-25-12" 
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 
 # --- КЛАВИАТУРЫ ---
@@ -58,32 +60,19 @@ def get_reset_keyboard():
 def get_stop_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Остановить", callback_data="stop_thinking")]])
 
-# --- РЕНДЕР ФОРМУЛ В КАРТИНКИ (СЕРВЕРНЫЙ) ---
+# --- РЕНДЕР ФОРМУЛ В КАРТИНКИ ---
 def render_latex_to_base64(latex: str) -> str:
-    """Превращает LaTeX-формулу в base64-картинку через matplotlib"""
-    if not HAS_MATPLOTLIB:
-        return ""
+    if not HAS_MATPLOTLIB: return ""
     try:
-        # Очищаем формулу от лишних символов
         latex = latex.strip()
-        if not latex:
-            return ""
-        
-        # Настраиваем matplotlib для рендера формул
+        if not latex: return ""
         fig = plt.figure(figsize=(0.01, 0.01))
         fig.text(0, 0, f"${latex}$", fontsize=14, color='black')
-        
         buf = io.BytesIO()
         plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0.1, dpi=150, transparent=False, facecolor='white')
-        buf.seek(0)
-        plt.close(fig)
-        
-        # Конвертируем в base64
-        img_base64 = base64.b64encode(buf.read()).decode('utf-8')
-        return img_base64
-    except Exception as e:
-        logger.error(f"Ошибка рендера формулы: {e}")
-        return ""
+        buf.seek(0); plt.close(fig)
+        return base64.b64encode(buf.read()).decode('utf-8')
+    except Exception: return ""
 
 # --- ПАРСЕР ТАБЛИЦ В PNG ---
 def markdown_to_png(text: str) -> io.BytesIO:
@@ -99,27 +88,22 @@ def markdown_to_png(text: str) -> io.BytesIO:
                 parts = [part.strip() for part in clean_line.strip('|').split('|')]
                 if all(re.match(r'^:?-+:?$', p) for p in parts if p): continue
                 if any(p for p in parts): table_data.append(parts)
-                
         if len(table_data) < 2: return None
         for row in table_data:
             for i in range(len(row)):
                 row[i] = row[i].replace('**', '').replace('*', '')
-
         max_cols = max(len(row) for row in table_data)
         for row in table_data:
             while len(row) < max_cols: row.append("")
-            
         fig, ax = plt.subplots(figsize=(14, max(2, len(table_data) * 0.8)))
         ax.axis('tight'); ax.axis('off')
         table = ax.table(cellText=table_data[1:], colLabels=table_data[0], cellLoc='left', loc='center')
         table.auto_set_font_size(False); table.set_fontsize(8); table.scale(1, 2.5)
-        
         for (row, col), cell in table.get_celld().items():
             cell.set_text_props(wrap=True)
             if row == 0:
                 cell.set_text_props(weight='bold', color='white'); cell.set_facecolor('#4a4a4a')
             else: cell.set_facecolor('#f0f0f0' if row % 2 == 0 else 'white')
-                
         buf = io.BytesIO()
         plt.savefig(buf, format='png', bbox_inches='tight', dpi=200)
         buf.seek(0); plt.close(fig)
@@ -224,16 +208,20 @@ def ask_mistral_vision(image_b64: str, user_text: str) -> str:
     ]
 
     try:
+        # Увеличили таймаут до 120 секунд для сложных фото
         response = requests.post(
             url=MISTRAL_API_URL,
             headers={"Authorization": f"Bearer {MISTRAL_KEY}", "Content-Type": "application/json"},
             json={"model": MISTRAL_VISION_MODEL, "messages": messages, "max_tokens": 4000},
-            timeout=60
+            timeout=120 
         )
         data = response.json()
         if "error" in data: return f"⚠️ Ошибка Mistral (фото): {data['error'].get('message')}"
         return data["choices"][0]["message"]["content"]
-    except Exception as e: return f"⚠️ Сбой Mistral (фото): {e}"
+    except requests.exceptions.Timeout:
+        return "⚠️ Mistral думал слишком долго (больше 2 минут). Попробуйте сфотографировать меньший участок или подождите."
+    except Exception as e: 
+        return f"⚠️ Сбой Mistral (фото): {e}"
 
 # --- СОЗДАНИЕ РЕФЕРАТА ---
 def create_gost_document(topic: str) -> io.BytesIO:
@@ -413,29 +401,22 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data["history"] = history[-8:]
                 return
 
-            # --- СЕРВЕРНЫЙ РЕНДЕР ФОРМУЛ ---
             clean_ai_response = ai_response.replace('<br>', '\n')
             
-            # Находим все формулы в тексте и рендерим их в картинки
             def replace_formula(match):
                 formula = match.group(1) or match.group(2) or match.group(3)
-                if not formula:
-                    return match.group(0)
-                
+                if not formula: return match.group(0)
                 img_b64 = render_latex_to_base64(formula)
                 if img_b64:
                     return f'<img src="data:image/png;base64,{img_b64}" style="vertical-align: middle; max-width: 100%;" alt="{formula}">'
                 return match.group(0)
             
-            # Ищем формулы в \( ... \), \[ ... \], $...$
             clean_ai_response = re.sub(
                 r'\\\((.*?)\\\)|\\\[(.*?)\\\]|\$(.*?)\$',
                 replace_formula,
                 clean_ai_response,
                 flags=re.DOTALL
             )
-            
-            # Обертка для остального текста
             clean_ai_response = clean_ai_response.replace('\n', '<br>')
 
             html_content = f"""<!DOCTYPE html>
@@ -462,7 +443,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             file_stream = io.BytesIO(html_content.encode('utf-8'))
             file_stream.name = "Reshenie.html"
-            await update.message.reply_document(document=file_stream, caption="📄 Вот HTML-файл с решением! Формулы встроены как картинки и видны на любом устройстве.")
+            await update.message.reply_document(document=file_stream, caption="📄 Вот HTML-файл с решением! Формулы встроены как картинки.")
             
             history = context.user_data.get("history", [])
             history.append({"role": "user", "content": f"[Фото задачи] {caption}"})
