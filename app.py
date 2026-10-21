@@ -237,7 +237,7 @@ def add_bookmark(paragraph, bookmark_name: str):
     end.set(qn('w:id'), str(hash(bookmark_name) % 100000))
     tag.append(end)
 
-# --- СОЗДАНИЕ РЕФЕРАТА (ТИТУЛЬНИК ПО ОБРАЗЦУ) ---
+# --- СОЗДАНИЕ РЕФЕРАТА (ОБНОВЛЕННЫЙ) ---
 def create_word_document(pages: int, topic: str, student_name: str, group: str, discipline: str, teacher: str, city: str) -> io.BytesIO:
     words_needed = pages * 300
     
@@ -247,9 +247,11 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
         "Структура: Введение (актуальность, цель, задачи), "
         "Основная часть (3 главы, в каждой 2 подглавы), Заключение, Список литературы. "
         "Пиши от третьего лица, академическим языком. "
-        "В КОНЦЕ КАЖДОЙ ПОДГЛАВЫ добавь абзац 'Мнение автора:' и напиши 2-3 предложения своего отношения. "
+        "ВАЖНО: В конце каждой подглавы и главы добавь небольшой абзац (2-3 предложения) с личным отношением к теме от первого лица (например, 'На мой взгляд...', 'Я считаю, что...'). "
+        "НЕ пиши заголовок 'Мнение автора:', просто начни абзац с личного мнения. "
         "Не используй Markdown. Заголовки пиши с новой строки ЗАГЛАВНЫМИ буквами. "
-        "Подзаголовки пиши с новой строки, начиная с номера (например, 1.1 Название)."
+        "Подзаголовки пиши с новой строки, начиная с номера (например, 1.1 Название). "
+        "В конце ОБЯЗАТЕЛЬНО сделай раздел 'СПИСОК ЛИТЕРАТУРЫ' с 5-7 источниками."
     )
     raw_text = ask_groq_text([{"role": "user", "content": prompt}])
     if not raw_text or "⚠️" in raw_text or "I'm sorry" in raw_text: 
@@ -292,8 +294,7 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
                 p.add_run(text)
             return p
 
-        # --- ТИТУЛЬНЫЙ ЛИСТ (КАК НА СКРИНШОТЕ) ---
-        # Шапка с министерством и вузом
+        # --- ТИТУЛЬНЫЙ ЛИСТ ---
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = p.add_run("МИНИСТЕРСТВО ОБРАЗОВАНИЯ И НАУКИ\nРОССИЙСКОЙ ФЕДЕРАЦИИ"); run.bold = True
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -303,7 +304,6 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
         
         for _ in range(4): doc.add_paragraph()
         
-        # Центральный блок
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.add_run("Реферат").bold = True
         p.runs[0].font.size = Pt(20)
@@ -322,15 +322,15 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
         
         for _ in range(6): doc.add_paragraph()
         
-        # Правый блок (Исполнитель)
+        # ИСПРАВЛЕННЫЙ БЛОК
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
         p.add_run(f"Выполнил: обучающийся\nгруппы {group}\n{student_name}")
+        
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
         p.add_run(f"Преподаватель: {teacher}")
         
         for _ in range(8): doc.add_paragraph()
         
-        # Нижний блок
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.add_run(f"{city}, 2026")
         
@@ -353,7 +353,7 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
             ("3.1.", "bookmark_ch3_1"),
             ("3.2.", "bookmark_ch3_2"),
             ("ЗАКЛЮЧЕНИЕ", "bookmark_conclusion"),
-            ("СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ", "bookmark_refs")
+            ("СПИСОК ЛИТЕРАТУРЫ", "bookmark_refs")
         ]
         
         for title, bookmark in toc_items:
@@ -390,13 +390,14 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
                 add_paragraph(line)
 
         # --- СПИСОК ЛИТЕРАТУРЫ ---
-        doc.add_page_break()
-        p = add_paragraph("СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ", is_heading=True)
-        add_bookmark(p, "bookmark_refs")
-        doc.add_paragraph()
-        add_paragraph("1. Иванов И.И. Основы теории. М.: Наука, 2020. 250 с.")
-        add_paragraph("2. Петров П.П. Практикум по дисциплине. СПб.: Питер, 2021. 180 с.")
-        add_paragraph("3. Сидоров С.С. Современные аспекты. М.: Юрайт, 2022. 300 с.")
+        if "СПИСОК ЛИТЕРАТУРЫ" not in raw_text.upper() and "СПИСОК ИСПОЛЬЗОВАННЫХ" not in raw_text.upper():
+            doc.add_page_break()
+            p = add_paragraph("СПИСОК ЛИТЕРАТУРЫ", is_heading=True)
+            add_bookmark(p, "bookmark_refs")
+            doc.add_paragraph()
+            add_paragraph("1. Иванов И.И. Основы теории. М.: Наука, 2020. 250 с.")
+            add_paragraph("2. Петров П.П. Практикум по дисциплине. СПб.: Питер, 2021. 180 с.")
+            add_paragraph("3. Сидоров С.С. Современные аспекты. М.: Юрайт, 2022. 300 с.")
 
         buf = io.BytesIO()
         doc.save(buf)
