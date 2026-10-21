@@ -15,16 +15,9 @@ try:
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    from matplotlib import mathtext
     HAS_MATPLOTLIB = True
 except Exception:
     HAS_MATPLOTLIB = False
-
-try:
-    from weasyprint import HTML
-    HAS_WEASYPRINT = True
-except Exception:
-    HAS_WEASYPRINT = False
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -64,38 +57,6 @@ def get_reset_keyboard():
 
 def get_stop_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Остановить", callback_data="stop_thinking")]])
-
-# --- РЕНДЕР ФОРМУЛ В SVG (ВЕКТОРНЫЙ ФОРМАТ) ---
-def render_latex_to_svg(latex: str) -> str:
-    """Превращает LaTeX-формулу в SVG-строку (вектор, не картинка)"""
-    if not HAS_MATPLOTLIB: return ""
-    try:
-        latex = latex.strip()
-        if not latex: return ""
-        
-        # Создаем фигуру с прозрачным фоном
-        fig = plt.figure(figsize=(0.01, 0.01))
-        fig.patch.set_alpha(0)
-        
-        # Рисуем формулу
-        fig.text(0, 0, f"${latex}$", fontsize=14, color='black')
-        
-        # Сохраняем в SVG (в буфер)
-        buf = io.StringIO()
-        plt.savefig(buf, format='svg', bbox_inches='tight', pad_inches=0.05, transparent=True)
-        buf.seek(0)
-        plt.close(fig)
-        
-        svg_content = buf.getvalue()
-        
-        # Извлекаем только содержимое <svg> (без XML-заголовка), чтобы вставить в HTML
-        svg_match = re.search(r'<svg[\s\S]*?</svg>', svg_content)
-        if svg_match:
-            return svg_match.group(0)
-        return ""
-    except Exception as e:
-        logger.error(f"Ошибка рендера SVG: {e}")
-        return ""
 
 # --- ПАРСЕР ТАБЛИЦ В PNG ---
 def markdown_to_png(text: str) -> io.BytesIO:
@@ -173,7 +134,7 @@ async def animate_thinking(update: Update, stop_event: asyncio.Event):
             if stop_event.is_set(): break
             try: 
                 await msg.edit_text(f"⏳ <b>MogAI думает...</b> ({seconds} сек)", parse_mode="HTML", reply_markup=get_stop_keyboard())
-            except Exception:
+            except Exception as e:
                 try:
                     await msg.delete()
                     msg = await update.message.reply_text(f"⏳ <b>MogAI думает...</b> ({seconds} сек)", parse_mode="HTML", reply_markup=get_stop_keyboard())
@@ -189,7 +150,11 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- ЗАПРОСЫ К GROQ (ТЕКСТ) ---
 def ask_groq_text(messages: list) -> str:
-    system_prompt = "Ты — MogAI. Отвечай текстом. Таблицы используй только по прямой просьбе."
+    system_prompt = (
+        "Ты — MogAI, полезный ассистент. Отвечай текстом. "
+        "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать таблицы (символ '|') без прямой просьбы пользователя. "
+        "Если пользователь явно попросил 'таблицу', используй только формат Markdown (| и -)."
+    )
     or_messages = [{"role": "system", "content": system_prompt}]
     for msg in messages[-8:]:
         or_messages.append({"role": msg["role"], "content": msg["content"]})
@@ -212,6 +177,7 @@ def ask_groq_text(messages: list) -> str:
 def ask_mistral_vision(image_b64: str, user_text: str) -> str:
     if not MISTRAL_KEY: return "⚠️ Для фото нужен MISTRAL_API_KEY."
 
+    # Если пользователь не просил решать, просим описать
     if user_text and "реши" in user_text.lower():
         prompt = (
             f"Пользователь прислал фото и просит: '{user_text}'.\n"
@@ -221,7 +187,7 @@ def ask_mistral_vision(image_b64: str, user_text: str) -> str:
         )
     else:
         prompt = (
-            "Пользователь прислал фото. Просто подробно опиши, что на этом фото. "
+            "Пользователь прислал фото без просьбы решать задачи. Твоя задача — просто подробно описать, что на этом фото. "
             "Начни ответ со слова 'ОПИСАНИЕ:'."
         )
 
@@ -240,15 +206,12 @@ def ask_mistral_vision(image_b64: str, user_text: str) -> str:
             url=MISTRAL_API_URL,
             headers={"Authorization": f"Bearer {MISTRAL_KEY}", "Content-Type": "application/json"},
             json={"model": MISTRAL_VISION_MODEL, "messages": messages, "max_tokens": 4000},
-            timeout=120
+            timeout=60
         )
         data = response.json()
         if "error" in data: return f"⚠️ Ошибка Mistral (фото): {data['error'].get('message')}"
         return data["choices"][0]["message"]["content"]
-    except requests.exceptions.Timeout:
-        return "⚠️ Mistral думал слишком долго. Попробуйте сфотографировать меньший участок."
-    except Exception as e: 
-        return f"⚠️ Сбой Mistral (фото): {e}"
+    except Exception as e: return f"⚠️ Сбой Mistral (фото): {e}"
 
 # --- СОЗДАНИЕ РЕФЕРАТА ---
 def create_gost_document(topic: str) -> io.BytesIO:
@@ -330,7 +293,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💬 Отвечать на вопросы\n"
         "📊 <b>Создавать таблицы</b> (по запросу)\n"
         "📝 <b>Писать рефераты по ГОСТу</b> (.docx)\n"
-        "🧮 <b>Решать задачи по фото</b> (пришлю PDF с формулами)\n\n"
+        "🧮 <b>Решать задачи по фото</b> (пришлю HTML)\n\n"
         "Напиши: <i>«напиши реферат на тему [тема]»</i> или пришли фото задачи с подписью «реши»."
     )
     await update.message.reply_text(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
@@ -354,7 +317,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["history"] = []
         await query.edit_message_text("🧹 Новый чат!", reply_markup=get_main_keyboard())
     elif query.data == "help":
-        text = "🤖 <b>Команды:</b>\n• /reset — сброс\n• «напиши реферат про...»\n• Пришли фото с подписью «реши» (пришлю PDF)."
+        text = "🤖 <b>Команды:</b>\n• /reset — сброс\n• «напиши реферат про...»\n• Пришли фото задачи (пришлю HTML)."
         await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -408,6 +371,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_bytes = await photo_file.download_as_bytearray()
             if len(file_bytes) > 4 * 1024 * 1024:
                 stop_event.set(); await anim; await update.message.reply_text("⚠️ Фото больше 4 МБ."); return
+            
             image_b64 = base64.b64encode(file_bytes).decode("utf-8")
             caption = update.message.caption or ""
             
@@ -428,25 +392,26 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data["history"] = history[-8:]
                 return
 
-            # Решение задачи. Делаем PDF с SVG-формулами
+            # Если это решение, делаем HTML
             clean_ai_response = ai_response.replace('<br>', '\n')
             
-            def replace_formula(match):
-                formula = match.group(1) or match.group(2) or match.group(3)
-                if not formula: return match.group(0)
-                # Рендерим в SVG (вектор)
-                svg = render_latex_to_svg(formula)
-                if svg:
-                    # Вставляем SVG прямо в HTML
-                    return f'<span style="display:inline-block; vertical-align:middle; max-width:100%;">{svg}</span>'
-                return match.group(0)
-            
-            clean_ai_response = re.sub(
-                r'\\\((.*?)\\\)|\\\[(.*?)\\\]|\$(.*?)\$',
-                replace_formula,
-                clean_ai_response,
-                flags=re.DOTALL
-            )
+            # Автоматически оборачиваем формулы в \( ... \), если их пропустили
+            def wrap_formulas(text):
+                # Ищем строки, которые похожи на формулы, но не обернуты
+                lines = text.split('\n')
+                new_lines = []
+                for line in lines:
+                    stripped = line.strip()
+                    # Если строка содержит математику и не обернута, оборачиваем
+                    if re.search(r'[=+\-^\\]', stripped) and not re.search(r'\$|\\\(|\\\[', stripped) and len(stripped) < 150:
+                        new_lines.append(f"\\({stripped}\\)")
+                    else:
+                        new_lines.append(line)
+                return '\n'.join(new_lines)
+
+            clean_ai_response = wrap_formulas(clean_ai_response)
+
+            # Заменяем переносы на <br> для HTML
             clean_ai_response = clean_ai_response.replace('\n', '<br>')
 
             html_content = f"""<!DOCTYPE html>
@@ -454,13 +419,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 <head>
     <meta charset="UTF-8">
     <title>Решение задачи от MogAI</title>
+    <!-- Подключаем MathJax для красивых формул -->
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <style>
-        @page {{ size: A4; margin: 2cm; }}
-        body {{ font-family: 'DejaVu Sans', 'Arial', sans-serif; line-height: 1.6; color: #333; }}
+        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.8; padding: 20px; max-width: 900px; margin: 0 auto; background-color: #f4f4f9; color: #333; }}
         h1 {{ color: #2c3e50; text-align: center; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
-        .solution {{ background: white; padding: 20px; font-size: 14px; }}
-        svg {{ vertical-align: middle; }}
-        .footer {{ text-align: center; margin-top: 30px; font-size: 10px; color: #7f8c8d; }}
+        .solution {{ background: white; padding: 25px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); font-size: 16px; }}
+        .footer {{ text-align: center; margin-top: 20px; font-size: 12px; color: #7f8c8d; }}
     </style>
 </head>
 <body>
@@ -472,31 +438,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 </body>
 </html>"""
 
-            pdf_buffer = io.BytesIO()
-            if HAS_WEASYPRINT:
-                try:
-                    HTML(string=html_content).write_pdf(pdf_buffer)
-                    pdf_buffer.seek(0)
-                    await update.message.reply_document(
-                        document=pdf_buffer, 
-                        filename="Reshenie.pdf", 
-                        caption="📄 Вот PDF-файл с решением! Формулы векторные (SVG), при увеличении не мутнеют."
-                    )
-                    return
-                except Exception as e:
-                    logger.error(f"Ошибка WeasyPrint: {e}")
-            
-            # Если PDF не удался, отправляем HTML
             file_stream = io.BytesIO(html_content.encode('utf-8'))
             file_stream.name = "Reshenie.html"
-            await update.message.reply_document(
-                document=file_stream, 
-                caption="📄 PDF не удался, поэтому вот HTML-файл с решением!"
-            )
-
+            await update.message.reply_document(document=file_stream, caption="📄 Вот HTML-файл с решением! Открой его в браузере, чтобы увидеть красивые формулы.")
+            
             history = context.user_data.get("history", [])
             history.append({"role": "user", "content": f"[Фото задачи] {caption}"})
-            history.append({"role": "assistant", "content": "Я решил задачу с фото."})
+            history.append({"role": "assistant", "content": "Я решил задачу с фото. Вот решение:\n" + clean_ai_response})
             context.user_data["history"] = history[-8:]
             
         finally:
