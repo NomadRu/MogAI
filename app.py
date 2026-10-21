@@ -236,7 +236,7 @@ def add_bookmark(paragraph, bookmark_name: str):
     end.set(qn('w:id'), str(hash(bookmark_name) % 100000))
     tag.append(end)
 
-# --- СОЗДАНИЕ РЕФЕРАТА ---
+# --- СОЗДАНИЕ РЕФЕРАТА (ИСПРАВЛЕННЫЕ РАЗРЫВЫ) ---
 def create_word_document(pages: int, topic: str, student_name: str, group: str, discipline: str, teacher: str, city: str) -> io.BytesIO:
     words_needed = pages * 300
     
@@ -319,7 +319,7 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
                 p.add_run(text)
             return p
 
-        # --- ТИТУЛЬНЫЙ ЛИСТ ---
+        # --- ТИТУЛЬНЫЙ ЛИСТ (ЖЕСТКО 1 СТРАНИЦА) ---
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = p.add_run("МИНИСТЕРСТВО ОБРАЗОВАНИЯ И НАУКИ\nРОССИЙСКОЙ ФЕДЕРАЦИИ"); run.bold = True
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -327,7 +327,8 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = p.add_run("«ПОВОЛЖСКИЙ ГОСУДАРСТВЕННЫЙ\nТЕХНОЛОГИЧЕСКИЙ УНИВЕРСИТЕТ» (ФГБОУ ВО\n«ПГТУ») ВЫСШИЙ КОЛЛЕДЖ ПГТУ «Политехник»"); run.bold = True
         
-        for _ in range(4): doc.add_paragraph()
+        # Убрал лишние пустые абзацы, чтобы влезло на 1 страницу
+        for _ in range(2): doc.add_paragraph()
         
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.add_run("Реферат").bold = True
@@ -336,8 +337,6 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.add_run(f"по дисциплине «{discipline}»")
         
-        for _ in range(2): doc.add_paragraph()
-        
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.add_run("на тему:")
         
@@ -345,7 +344,7 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
         p.add_run(f"«{topic}»").bold = True
         p.runs[0].font.size = Pt(16)
         
-        for _ in range(6): doc.add_paragraph()
+        for _ in range(4): doc.add_paragraph()
         
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
         p.add_run(f"Выполнил: обучающийся\nгруппы {group}\n{student_name}")
@@ -353,17 +352,16 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
         p.add_run(f"Преподаватель: {teacher}")
         
-        for _ in range(8): doc.add_paragraph()
+        for _ in range(4): doc.add_paragraph()
         
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.add_run(f"{city}, 2026")
         
-        doc.add_page_break()
+        doc.add_page_break() # Конец титульника
 
-        # --- ОГЛАВЛЕНИЕ ---
+        # --- ОГЛАВЛЕНИЕ (1 СТРАНИЦА) ---
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.add_run("СОДЕРЖАНИЕ").bold = True
-        doc.add_paragraph()
         
         toc_items = [
             ("ВВЕДЕНИЕ", "bookmark_intro"),
@@ -395,26 +393,27 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
             tab.alignment = WD_TAB_ALIGNMENT.RIGHT
             tab.leader = WD_TAB_LEADER.DOTS
         
-        doc.add_page_break()
+        doc.add_page_break() # Конец оглавления
 
         # --- ОСНОВНОЙ ТЕКСТ ---
         lines = full_text.split('\n')
-        need_page_break = False
         
         for line in lines:
             line = line.strip()
             if not line: continue
             
             line_upper = line.upper()
-            is_chapter = line_upper.startswith("ГЛАВА")
+            
+            # ЖЕСТКАЯ ПРОВЕРКА НА РАЗРЫВ
+            # Если строка начинается на ГЛАВА (любой регистр) или это ВВЕДЕНИЕ/ЗАКЛЮЧЕНИЕ/СПИСОК
+            is_chapter = line_upper.startswith("ГЛАВА") or line_upper.startswith("ГЛАВА ") or re.match(r'^ГЛАВА\s+[IVX\d]+', line_upper)
             is_section = line_upper in ["ВВЕДЕНИЕ", "ЗАКЛЮЧЕНИЕ", "СПИСОК ЛИТЕРАТУРЫ", "СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ"]
             is_subheading = re.match(r'^\d+\.\d+', line)
             
             if is_chapter or is_section:
-                if not need_page_break:
-                    if line_upper != "ВВЕДЕНИЕ":
-                        doc.add_page_break()
-                    need_page_break = True
+                # Ставим разрыв перед каждой главой (кроме Введения, т.к. оно сразу после оглавления)
+                if line_upper != "ВВЕДЕНИЕ":
+                    doc.add_page_break()
                 
                 p = add_paragraph(line, is_heading=True)
                 bookmark_name = f"bookmark_{line[:10].replace(' ', '_').replace('.', '_')}"
@@ -422,6 +421,7 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
                 doc.add_paragraph()
             
             elif is_subheading:
+                # Подглавы идут подряд, без разрывов
                 p = add_paragraph(line, is_bold=True)
                 bookmark_name = f"bookmark_{line[:10].replace(' ', '_').replace('.', '_')}"
                 add_bookmark(p, bookmark_name)
@@ -430,7 +430,7 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
             else:
                 add_paragraph(line)
 
-        # --- СПИСОК ЛИТЕРАТУРЫ (10 ИСТОЧНИКОВ НА РУССКОМ) ---
+        # --- СПИСОК ЛИТЕРАТУРЫ ---
         doc.add_page_break()
         p = add_paragraph("СПИСОК ЛИТЕРАТУРЫ", is_heading=True)
         add_bookmark(p, "bookmark_refs")
@@ -609,7 +609,6 @@ async def send_safe_message(update: Update, text: str):
 
 # --- ХЕНДЛЕРЫ ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Сбрасываем все флаги ожидания, чтобы /start всегда работал
     context.user_data["waiting_for_photo_prompt"] = False
     context.user_data["waiting_for_word_data"] = False
     context.user_data["waiting_for_text_data"] = False
@@ -640,7 +639,6 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⚠️ <b>Вы уверены?</b>", reply_markup=get_reset_keyboard(), parse_mode="HTML")
 
 async def photo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Сбрасываем другие флаги
     context.user_data["waiting_for_word_data"] = False
     context.user_data["waiting_for_text_data"] = False
     context.user_data["waiting_for_photo_prompt"] = True
@@ -652,7 +650,6 @@ async def photo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=get_cancel_keyboard())
 
 async def word_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Сбрасываем другие флаги
     context.user_data["waiting_for_photo_prompt"] = False
     context.user_data["waiting_for_text_data"] = False
     context.user_data["waiting_for_word_data"] = True
@@ -668,7 +665,6 @@ async def word_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=get_cancel_keyboard())
 
 async def text_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Сбрасываем другие флаги
     context.user_data["waiting_for_photo_prompt"] = False
     context.user_data["waiting_for_word_data"] = False
     context.user_data["waiting_for_text_data"] = True
@@ -692,7 +688,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     if query.data == "cancel_action":
-        # Сбрасываем все флаги ожидания
         context.user_data["waiting_for_photo_prompt"] = False
         context.user_data["waiting_for_word_data"] = False
         context.user_data["waiting_for_text_data"] = False
