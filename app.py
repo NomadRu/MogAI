@@ -36,8 +36,14 @@ MISTRAL_KEY = os.environ.get("MISTRAL_API_KEY")
 if not TOKEN or not GROQ_KEY:
     raise ValueError("Не заданы TELEGRAM_TOKEN или GROQ_API_KEY!")
 
+# --- МОДЕЛИ ---
 GROQ_TEXT_MODELS = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "openai/gpt-oss-20b"]
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+# Qwen 3.8 27B — специально для формул, схем и OCR (через Groq)
+GROQ_VISION_MODEL = "qwen/qwen3.8-27b"
+
+# Запасная модель Mistral (устарела, но оставим как резерв)
 MISTRAL_VISION_MODEL = "pixtral-12b-2409"
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 
@@ -134,7 +140,7 @@ async def animate_thinking(update: Update, stop_event: asyncio.Event):
             if stop_event.is_set(): break
             try: 
                 await msg.edit_text(f"⏳ <b>MogAI думает...</b> ({seconds} сек)", parse_mode="HTML", reply_markup=get_stop_keyboard())
-            except Exception as e:
+            except Exception:
                 try:
                     await msg.delete()
                     msg = await update.message.reply_text(f"⏳ <b>MogAI думает...</b> ({seconds} сек)", parse_mode="HTML", reply_markup=get_stop_keyboard())
@@ -173,44 +179,58 @@ def ask_groq_text(messages: list) -> str:
         except Exception: continue
     return "⚠️ Ошибка Groq."
 
-# --- ЗАПРОСЫ К MISTRAL (ФОТО) ---
-def ask_mistral_vision(image_b64: str, user_text: str) -> str:
-    if not MISTRAL_KEY: return "⚠️ Для фото нужен MISTRAL_API_KEY."
-
-    if user_text and "реши" in user_text.lower():
-        prompt = (
-            f"Пользователь прислал фото и просит: '{user_text}'.\n"
-            "Реши ВСЕ задачи на фото. Доводи каждое решение до конца. "
-            "ОБЯЗАТЕЛЬНО используй LaTeX для формул: пиши математику строго внутри \\( ... \\) для строчных или \\[ ... \\] для блочных. "
-            "НЕ используй HTML-теги <br> внутри формул LaTeX."
-        )
-    else:
-        prompt = (
-            "Пользователь прислал фото без просьбы решать задачи. Твоя задача — просто подробно описать, что на этом фото. "
-            "Начни ответ со слова 'ОПИСАНИЕ:'."
-        )
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
+# --- УМНЫЙ ЗАПРОС ДЛЯ ФОТО (Qwen -> Mistral) ---
+def ask_vision_model(image_b64: str, user_text: str) -> str:
+    # 1. Пробуем Qwen через Groq (лучший для формул и схем)
+    if GROQ_KEY:
+        try:
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_text or "Реши задачи на фото. Распиши пошагово, используя LaTeX для формул."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
+                    ]
+                }
             ]
-        }
-    ]
+            response = requests.post(
+                url=GROQ_API_URL,
+                headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+                json={"model": GROQ_VISION_MODEL, "messages": messages, "max_tokens": 4000},
+                timeout=60
+            )
+            data = response.json()
+            if "error" not in data and "choices" in data:
+                return data["choices"][0]["message"]["content"]
+            logger.warning(f"Groq Vision упал: {data.get('error')}")
+        except Exception as e:
+            logger.warning(f"Сбой Groq Vision: {e}")
 
-    try:
-        response = requests.post(
-            url=MISTRAL_API_URL,
-            headers={"Authorization": f"Bearer {MISTRAL_KEY}", "Content-Type": "application/json"},
-            json={"model": MISTRAL_VISION_MODEL, "messages": messages, "max_tokens": 4000},
-            timeout=60
-        )
-        data = response.json()
-        if "error" in data: return f"⚠️ Ошибка Mistral (фото): {data['error'].get('message')}"
-        return data["choices"][0]["message"]["content"]
-    except Exception as e: return f"⚠️ Сбой Mistral (фото): {e}"
+    # 2. Если Groq не смог, идем в Mistral (устаревшая, но как резерв)
+    if MISTRAL_KEY:
+        try:
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_text or "Реши задачи на фото."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
+                    ]
+                }
+            ]
+            response = requests.post(
+                url=MISTRAL_API_URL,
+                headers={"Authorization": f"Bearer {MISTRAL_KEY}", "Content-Type": "application/json"},
+                json={"model": MISTRAL_VISION_MODEL, "messages": messages, "max_tokens": 4000},
+                timeout=60
+            )
+            data = response.json()
+            if "error" not in data and "choices" in data:
+                return data["choices"][0]["message"]["content"]
+        except Exception as e:
+            return f"⚠️ Сбой всех Vision-моделей: {e}"
+    
+    return "⚠️ Нет доступных ключей для фото."
 
 # --- СОЗДАНИЕ РЕФЕРАТА ---
 def create_gost_document(topic: str) -> io.BytesIO:
@@ -374,7 +394,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             image_b64 = base64.b64encode(file_bytes).decode("utf-8")
             caption = update.message.caption or ""
             
-            ai_response = await asyncio.to_thread(ask_mistral_vision, image_b64, caption)
+            ai_response = await asyncio.to_thread(ask_vision_model, image_b64, caption)
             
             if stop_event.is_set(): return
             
@@ -394,8 +414,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # --- ОЧИСТКА ОТ ЛИШНИХ СИМВОЛОВ ---
             clean_ai_response = ai_response.replace('<br>', '\n')
             
-            # Убираем \( и \) внутри \[ ... \] (если есть)
-            # Ищем блоки \[ ... \] и чистим внутренности
             def clean_block(match):
                 block = match.group(1)
                 block = block.replace('\\(', '').replace('\\)', '')
@@ -403,12 +421,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return f"\\[{block}\\]"
             
             clean_ai_response = re.sub(r'\\\[(.*?)\\\]', clean_block, clean_ai_response, flags=re.DOTALL)
-            
-            # Убираем двойные слэши в конце строк (в матрицах) — заменяем на пробел или убираем
             clean_ai_response = clean_ai_response.replace('\\\\', ' ')
 
-            # --- ОБОРАЧИВАНИЕ ФОРМУЛ ---
-            # Ищем строки, которые похожи на формулы, но не обернуты
             lines = clean_ai_response.split('\n')
             new_lines = []
             for line in lines:
@@ -426,7 +440,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 <head>
     <meta charset="UTF-8">
     <title>Решение задачи от MogAI</title>
-    <!-- Подключаем MathJax для красивых формул -->
     <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
     <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <style>
