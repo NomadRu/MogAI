@@ -55,6 +55,9 @@ def get_reset_keyboard():
 def get_stop_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Остановить", callback_data="stop_thinking")]])
 
+def get_cancel_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")]])
+
 # --- ГЕНЕРАЦИЯ ФОТО ---
 def generate_image(prompt: str) -> str:
     encoded_prompt = requests.utils.quote(prompt)
@@ -606,7 +609,12 @@ async def send_safe_message(update: Update, text: str):
 
 # --- ХЕНДЛЕРЫ ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Проверяем, есть ли уже история    history = context.user_data.get("history", [])
+    # Сбрасываем все флаги ожидания, чтобы /start всегда работал
+    context.user_data["waiting_for_photo_prompt"] = False
+    context.user_data["waiting_for_word_data"] = False
+    context.user_data["waiting_for_text_data"] = False
+    
+    history = context.user_data.get("history", [])
     
     if history:
         text = (
@@ -632,15 +640,23 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⚠️ <b>Вы уверены?</b>", reply_markup=get_reset_keyboard(), parse_mode="HTML")
 
 async def photo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Сбрасываем другие флаги
+    context.user_data["waiting_for_word_data"] = False
+    context.user_data["waiting_for_text_data"] = False
     context.user_data["waiting_for_photo_prompt"] = True
+    
     text = (
         "🎨 <b>Режим генерации фото.</b>\n\n"
         "Напиши, что хочешь нарисовать (например: <i>кот в космосе, неоновый город, дракон</i>)."
     )
-    await update.message.reply_text(text, parse_mode="HTML")
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=get_cancel_keyboard())
 
 async def word_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Сбрасываем другие флаги
+    context.user_data["waiting_for_photo_prompt"] = False
+    context.user_data["waiting_for_text_data"] = False
     context.user_data["waiting_for_word_data"] = True
+    
     text = (
         "📝 <b>Создание реферата по ГОСТу.</b>\n\n"
         "Отправь данные <b>одним сообщением</b> через запятую в таком порядке:\n"
@@ -649,10 +665,14 @@ async def word_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<i>15, История ИИ, Иванов И.И., ИВТ-21, Информатика, Петров П.П., Москва</i>\n\n"
         "Максимум 20 страниц."
     )
-    await update.message.reply_text(text, parse_mode="HTML")
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=get_cancel_keyboard())
 
 async def text_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Сбрасываем другие флаги
+    context.user_data["waiting_for_photo_prompt"] = False
+    context.user_data["waiting_for_word_data"] = False
     context.user_data["waiting_for_text_data"] = True
+    
     text = (
         "📄 <b>Создание сплошного текста.</b>\n\n"
         "Отправь данные <b>одним сообщением</b> через запятую в таком порядке:\n"
@@ -663,14 +683,21 @@ async def text_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Пример с титульником:\n"
         "<i>30, История космонавтики, доклад, Иванов И.И., ИВТ-21, Астрономия, Петров П.П., Москва</i>"
     )
-    await update.message.reply_text(text, parse_mode="HTML")
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=get_cancel_keyboard())
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query.data == "stop_thinking":
         await stop_callback(update, context); return
     await query.answer()
-    if query.data == "reset_confirm":
+    
+    if query.data == "cancel_action":
+        # Сбрасываем все флаги ожидания
+        context.user_data["waiting_for_photo_prompt"] = False
+        context.user_data["waiting_for_word_data"] = False
+        context.user_data["waiting_for_text_data"] = False
+        await query.edit_message_text("❌ <b>Действие отменено.</b>", parse_mode="HTML")
+    elif query.data == "reset_confirm":
         await query.edit_message_text("⚠️ Вы уверены?", reply_markup=get_reset_keyboard(), parse_mode="HTML")
     elif query.data == "reset_yes":
         context.user_data["history"] = []
