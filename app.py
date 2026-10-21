@@ -132,8 +132,13 @@ async def animate_thinking(update: Update, stop_event: asyncio.Event):
         while not stop_event.is_set():
             await asyncio.sleep(2); seconds += 2
             if stop_event.is_set(): break
-            try: await msg.edit_text(f"⏳ <b>MogAI думает...</b> ({seconds} сек)", parse_mode="HTML", reply_markup=get_stop_keyboard())
-            except Exception: pass
+            try: 
+                await msg.edit_text(f"⏳ <b>MogAI думает...</b> ({seconds} сек)", parse_mode="HTML", reply_markup=get_stop_keyboard())
+            except Exception:
+                try:
+                    await msg.delete()
+                    msg = await update.message.reply_text(f"⏳ <b>MogAI думает...</b> ({seconds} сек)", parse_mode="HTML", reply_markup=get_stop_keyboard())
+                except: pass
     except Exception: pass
 
 async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -145,7 +150,12 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- ЗАПРОСЫ К GROQ (ТЕКСТ) ---
 def ask_groq_text(messages: list) -> str:
-    or_messages = [{"role": "system", "content": "Ты — MogAI. Отвечай текстом. Если просят таблицу, пиши её ТОЛЬКО в формате Markdown (| и -)."}]
+    system_prompt = (
+        "Ты — MogAI, полезный ассистент. Отвечай текстом. "
+        "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать таблицы (символ '|') без прямой просьбы пользователя. "
+        "Если пользователь явно попросил 'таблицу', используй только формат Markdown (| и -)."
+    )
+    or_messages = [{"role": "system", "content": system_prompt}]
     for msg in messages[-8:]:
         or_messages.append({"role": msg["role"], "content": msg["content"]})
 
@@ -249,7 +259,7 @@ def create_gost_document(topic: str) -> io.BytesIO:
 # --- ОТПРАВКА ---
 async def send_safe_message(update: Update, text: str):
     try:
-        if "|" in text:
+        if text.count('|') > 5 and text.count('\n') > 1:
             png_buffer = markdown_to_png(text)
             if png_buffer:
                 await update.message.reply_photo(photo=png_buffer, caption="📊 Вот твоя таблица!")
@@ -276,7 +286,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 <b>Привет! Я MogAI.</b>\n\n"
         "Я умею:\n"
         "💬 Отвечать на вопросы\n"
-        "📊 <b>Создавать таблицы</b>\n"
+        "📊 <b>Создавать таблицы</b> (по запросу)\n"
         "📝 <b>Писать рефераты по ГОСТу</b> (.docx)\n"
         "🧮 <b>Решать задачи по фото</b> (пришлю HTML)\n\n"
         "Напиши: <i>«напиши реферат на тему [тема]»</i> или пришли фото задачи."
@@ -367,17 +377,31 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(ai_response)
                 return
 
-            # Если это просто описание фото (мем, кот и т.д.)
             if ai_response.startswith("ОПИСАНИЕ:"):
                 clean_desc = ai_response.replace("ОПИСАНИЕ:", "").strip()
                 await update.message.reply_text(f"📸 {clean_desc}")
+                history = context.user_data.get("history", [])
+                history.append({"role": "user", "content": f"[Фото] {caption}"})
+                history.append({"role": "assistant", "content": clean_desc})
+                context.user_data["history"] = history[-8:]
                 return
 
-            # Очищаем от HTML-тегов внутри формул, чтобы MathJax их понял
-            # Заменяем <br> на обычный перенос строки
+            # Очистка формул от лишнего и обертка в $...$, если забыл
             clean_ai_response = ai_response.replace('<br>', '\n')
             
-            # Формируем HTML
+            # Автоматическая обертка формул, если ИИ забыл поставить $ или \( \)
+            # Ищем выражения с математическими символами и оборачиваем
+            lines = clean_ai_response.split('\n')
+            new_lines = []
+            for line in lines:
+                # Если в строке есть признаки формулы и нет тегов MathJax
+                if re.search(r'[=+\-^\\]', line) and not re.search(r'\$|\\\(|\\\[', line):
+                    # Оборачиваем всю строку в \( \), если это похоже на формулу
+                    if len(line) < 100 and not line.strip().endswith('.'):
+                        line = f"\\({line}\\)"
+                new_lines.append(line)
+            clean_ai_response = '\n'.join(new_lines)
+
             html_content = f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -393,14 +417,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     <style>
         body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; padding: 20px; max-width: 900px; margin: 0 auto; background-color: #f4f4f9; color: #333; }}
         h1 {{ color: #2c3e50; text-align: center; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
-        .solution {{ background: white; padding: 25px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); font-size: 18px; line-height: 1.8; white-space: pre-wrap; }}
+        .solution {{ background: white; padding: 25px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); font-size: 18px; line-height: 1.8; }}
         .footer {{ text-align: center; margin-top: 20px; font-size: 12px; color: #7f8c8d; }}
     </style>
 </head>
 <body>
     <h1>📝 Решение задачи</h1>
     <div class="solution">
-{clean_ai_response}
+        {clean_ai_response}
     </div>
     <div class="footer">Сгенерировано MogAI</div>
 </body>
@@ -412,7 +436,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             history = context.user_data.get("history", [])
             history.append({"role": "user", "content": f"[Фото задачи] {caption}"})
-            history.append({"role": "assistant", "content": "Решение отправлено в HTML."})
+            history.append({"role": "assistant", "content": "Я решил задачу с фото. Вот решение:\n" + clean_ai_response})
             context.user_data["history"] = history[-8:]
             
         finally:
