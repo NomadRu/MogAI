@@ -8,6 +8,7 @@ import re
 import secrets
 import zlib
 import traceback
+import html
 from docx import Document
 from docx.shared import Pt, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
@@ -15,6 +16,7 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from docx.enum.text import WD_TAB_ALIGNMENT, WD_TAB_LEADER
 
+# --- БИБЛИОТЕКИ ДЛЯ ГРАФИКИ И PDF ---
 try:
     import matplotlib
     matplotlib.use('Agg')
@@ -24,10 +26,10 @@ except Exception:
     HAS_MATPLOTLIB = False
 
 try:
-    from weasyprint import HTML as WeasyHTML
-    HAS_WEASYPRINT = True
+    import cairosvg
+    HAS_CAIROSVG = True
 except Exception:
-    HAS_WEASYPRINT = False
+    HAS_CAIROSVG = False
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -229,62 +231,116 @@ def has_math_formulas(text: str) -> bool:
     ]
     return any(re.search(p, text, re.DOTALL) for p in patterns)
 
-# --- HTML С MATHJAX ---
-def build_mathjax_html(content: str, for_pdf: bool = False) -> str:
-    clean_response = content.replace('<br>', '\n')
+# --- РЕНДЕР ФОРМУЛ И СБОРКА PDF ---
+def render_latex_to_svg(latex_str: str, fontsize: int = 14) -> str | None:
+    if not HAS_MATPLOTLIB:
+        return None
+    latex_str = latex_str.strip()
+    for pattern in [r'^\$\$(.+?)\$\$$', r'^\$(.+?)\$$', r'^\\\[(.+?)\\\]$', r'^\\\((.+?)\\\)$']:
+        m = re.match(pattern, latex_str, re.DOTALL)
+        if m:
+            latex_str = m.group(1).strip()
+            break
+    if not latex_str:
+        return None
+    try:
+        fig = plt.figure(figsize=(0.1, 0.1))
+        fig.patch.set_alpha(0.0)
+        fig.text(0, 0, f"${latex_str}$", fontsize=fontsize, color='black')
+        svg_buf = io.StringIO()
+        fig.savefig(svg_buf, format='svg', bbox_inches='tight', pad_inches=0.02, transparent=True, facecolor='none')
+        plt.close(fig)
+        return svg_buf.getvalue()
+    except Exception as e:
+        logger.warning(f"Не удалось отрендерить формулу: {e}")
+        return None
 
-    lines = clean_response.split('\n')
-    new_lines = []
-    for line in lines:
-        stripped = line.strip()
-        if (re.search(r'[=+\-^\\]', stripped)
-                and not re.search(r'\$|\\\(|\\\[', stripped)
-                and 0 < len(stripped) < 150):
-            new_lines.append(f"\\({stripped}\\)")
+def build_pdf_with_formulas(text: str, fontsize: int = 14) -> io.BytesIO | None:
+    if not HAS_CAIROSVG:
+        return None
+    formula_pattern = re.compile(r'(\$\$.*?\$\$|\$.*?\$|\\\[.*?\\\]|\\\(.*?\\\))', re.DOTALL)
+    parts = formula_pattern.split(text)
+    
+    svg_parts = []
+    y_offset = 50
+    line_height = fontsize * 1.6
+    max_width = 495  # A4: 595px - 2*50px отступы
+
+    for part in parts:
+        if not part.strip():
+            continue
+        
+        is_formula = bool(formula_pattern.fullmatch(part))
+        
+        if is_formula:
+            svg = render_latex_to_svg(part, fontsize=fontsize)
+            if svg:
+                inner = re.sub(r'^<\?xml.*?\?>\s*<svg[^>]*>', '', svg, flags=re.DOTALL).replace('</svg>', '')
+                svg_parts.append(f'<g transform="translate(50, {y_offset - 20})">{inner}</g>')
+                y_offset += fontsize * 2.5
+            else:
+                svg_parts.append(f'<text x="50" y="{y_offset}" font-size="{fontsize}" font-family="sans-serif" fill="black">{html.escape(part)}</text>')
+                y_offset += line_height
         else:
-            new_lines.append(line)
-    clean_response = '\n'.join(new_lines)
+            for line in part.split('\n'):
+                line = line.strip()
+                if not line:
+                    y_offset += line_height * 0.5
+                    continue
+                
+                line_escaped = html.escape(line)
+                words = line_escaped.split(' ')
+                current_line = ''
+                
+                for word in words:
+                    test = current_line + (' ' if current_line else '') + word
+                    # Оценка ширины: 1 символ ≈ fontsize * 0.5 px
+                    if len(test) * fontsize * 0.5 > max_width:
+                        svg_parts.append(f'<text x="50" y="{y_offset}" font-size="{fontsize}" font-family="sans-serif" fill="black">{current_line}</text>')
+                        y_offset += line_height
+                        current_line = word
+                    else:
+                        current_line = test
+                        
+                if current_line:
+                    svg_parts.append(f'<text x="50" y="{y_offset}" font-size="{fontsize}" font-family="sans-serif" fill="black">{current_line}</text>')
+                    y_offset += line_height
 
-    mj_script = ""
-    if not for_pdf:
-        mj_script = (
-            '<script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>'
-            '<script id="MathJax-script" async '
-            'src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>'
-        )
+    total_height = max(y_offset + 50, 842)  # минимум A4 по высоте (842px)
+    
+    # Сборка SVG документа
+    full_svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="595" height="{total_height}">
+    <rect width="100%" height="100%" fill="white"/>
+    {''.join(svg_parts)}
+    </svg>'''
+    
+    try:
+        pdf_bytes = cairosvg.svg2pdf(bytestring=full_svg.encode('utf-8'))
+        buf = io.BytesIO(pdf_bytes)
+        buf.seek(0)
+        return buf
+    except Exception as e:
+        logger.error(f"CairoSVG PDF не собрался: {e}")
+        return None
 
+def build_mathjax_html(content: str) -> str:
+    clean_response = html.escape(content).replace('\n', '<br>')
     return f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
     <title>Ответ от MogAI</title>
-    {mj_script}
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <style>
-        @page {{ size: A4; margin: 2cm; }}
-        body {{ font-family: 'DejaVu Sans', 'Segoe UI', sans-serif; line-height: 1.7; color: #222; }}
-        h1 {{ color: #2c3e50; text-align: center; border-bottom: 2px solid #3498db; padding-bottom: 8px; }}
-        .solution {{ padding: 10px; font-size: 14px; white-space: pre-wrap; word-wrap: break-word; }}
-        .footer {{ text-align: center; margin-top: 20px; font-size: 10px; color: #888; }}
+        body {{ font-family: 'Segoe UI', sans-serif; line-height: 1.7; padding: 20px; max-width: 800px; margin: auto; background-color: #f9f9f9; }}
+        .solution {{ background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
     </style>
 </head>
 <body>
-    <h1>Ответ от MogAI</h1>
     <div class="solution">{clean_response}</div>
-    <div class="footer">Сгенерировано MogAI</div>
 </body>
 </html>"""
-
-def html_to_pdf(html_content: str):
-    if not HAS_WEASYPRINT:
-        return None
-    try:
-        pdf_bytes = WeasyHTML(string=html_content).write_pdf()
-        buf = io.BytesIO(pdf_bytes)
-        buf.seek(0)
-        return buf
-    except Exception as e:
-        logger.warning(f"weasyprint не смог: {e}")
-        return None
 
 # --- АНИМАЦИЯ ---
 async def animate_thinking(update: Update, stop_event: asyncio.Event):
@@ -338,7 +394,8 @@ def ask_groq_text(messages: list) -> str:
         "раскрывая тему с научной и культурной точки зрения. "
         "Отвечай только на русском языке. Используй академический стиль. "
         "ВАЖНО: НЕ создавай markdown-таблицы, если пользователь прямо не попросил 'таблицу'. "
-        "Описывай данные обычным текстом или списком."
+        "Описывай данные обычным текстом или списком. "
+        "Формулы оформляй в LaTeX: $...$ для строчных, $$...$$ для выключных."
     )
     or_messages = [{"role": "system", "content": system_prompt}]
     for msg in messages[-8:]:
@@ -731,22 +788,23 @@ async def send_safe_message(update: Update, text: str, user_query: str = ""):
                 text = "Не удалось подобрать удачный ответ. Попробуй переформулировать вопрос."
 
         if has_math_formulas(text) or (user_query and re.search(r'[=+\-^\\]', text) and len(text) > 800):
-            html_content = build_mathjax_html(text, for_pdf=True)
-            pdf_buf = html_to_pdf(html_content)
+            # Пытаемся собрать PDF с векторами формул
+            pdf_buf = await asyncio.to_thread(build_pdf_with_formulas, text)
             if pdf_buf:
                 pdf_buf.name = "MogAI_Reshenie.pdf"
                 await update.message.reply_document(
                     document=pdf_buf,
-                    caption="📄 Ответ с формулами. Открой PDF."
+                    caption="📄 Ответ с формулами (векторный PDF)."
                 )
                 return
             else:
-                html_content2 = build_mathjax_html(text, for_pdf=False)
-                file_stream = io.BytesIO(html_content2.encode('utf-8'))
+                # Fallback: HTML с MathJax
+                html_content = build_mathjax_html(text)
+                file_stream = io.BytesIO(html_content.encode('utf-8'))
                 file_stream.name = "MogAI_Reshenie.html"
                 await update.message.reply_document(
                     document=file_stream,
-                    caption="📄 Открой HTML — формулы отрисуются в браузере."
+                    caption="📄 PDF не собрался. Открой HTML — формулы отрисуются в браузере."
                 )
                 return
 
@@ -783,7 +841,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📊 <b>Создавать таблицы</b> (если попросишь)\n"
             "📝 <b>Писать рефераты по ГОСТу</b> (команда /word)\n"
             "📄 <b>Писать сплошной текст</b> (команда /text)\n"
-            "🧮 <b>Читать фото и решать задачи</b>\n"
+            "🧮 <b>Читать фото и решать задачи</b> (с красивыми формулами в PDF)\n"
             "🎨 <b>Генерировать картинки</b> (команда /photo)\n\n"
             "Напиши что-нибудь или используй команды."
         )
@@ -1067,4 +1125,4 @@ if __name__ == "__main__":
         url_path=TOKEN,
         webhook_url=f"{URL}/{TOKEN}",
         drop_pending_updates=False,
-    )
+        )
