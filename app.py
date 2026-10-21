@@ -23,6 +23,12 @@ try:
 except Exception:
     HAS_MATPLOTLIB = False
 
+try:
+    from weasyprint import HTML as WeasyHTML
+    HAS_WEASYPRINT = True
+except Exception:
+    HAS_WEASYPRINT = False
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -66,7 +72,6 @@ def generate_image(prompt: str) -> str:
     return f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&model=flux&nologo=true&seed={secrets.token_hex(4)}"
 
 def check_image_url(url: str, timeout: int = 25) -> bool:
-    """Проверяет, что Pollinations реально отдал картинку."""
     try:
         r = requests.get(url, timeout=timeout, stream=True)
         ct = r.headers.get("Content-Type", "")
@@ -158,13 +163,9 @@ def format_text_for_telegram(text: str) -> str:
         return text
 
 # --- УТИЛИТЫ ПАРСИНГА ---
-_SPLIT_RE = re.compile(r',(?![^«»"]*[»"])|(?![^"]*")')  # упрощённый, но безопаснее обычного split
-
 def smart_split(user_text: str):
-    """Разбивает строку по запятым, не ломая содержимое в «...», "..." и '...'."""
     result = []
     current = []
-    depth = 0
     in_quote = None
     for ch in user_text:
         if ch in '«"\'„“”' and in_quote is None:
@@ -184,6 +185,106 @@ def smart_split(user_text: str):
     if current:
         result.append(''.join(current).strip())
     return [p for p in result if p]
+
+# --- ОПРЕДЕЛЕНИЕ: ХОЧЕТ ЛИ ПОЛЬЗОВАТЕЛЬ ТАБЛИЦУ ---
+TABLE_TRIGGERS = re.compile(
+    r'\b(таблиц|таблич|сравн|сравнить|в\s+виде\s+табл|оформи\s+табл|'
+    r'представь\s+в\s+табл|покажи\s+в\s+табл|сделай\s+табл)\w*',
+    re.IGNORECASE
+)
+
+def wants_table(user_text: str) -> bool:
+    return bool(user_text and TABLE_TRIGGERS.search(user_text))
+
+def strip_markdown_tables(text: str) -> str:
+    lines = text.split('\n')
+    result = []
+    skip_block = False
+    for line in lines:
+        stripped = line.strip()
+        is_sep = re.match(r'^\|?[\s:|-]+\|[\s:|-]*$', stripped) and '-' in stripped
+        if stripped.startswith('|') and stripped.endswith('|'):
+            skip_block = True
+            continue
+        if is_sep:
+            skip_block = True
+            continue
+        if skip_block:
+            if not stripped.startswith('|'):
+                skip_block = False
+            else:
+                continue
+        result.append(line)
+    return '\n'.join(result)
+
+# --- ОПРЕДЕЛЕНИЕ: ЕСТЬ ЛИ МАТЕМАТИКА ---
+def has_math_formulas(text: str) -> bool:
+    patterns = [
+        r'\$\$.+?\$\$',
+        r'\$.+?\$',
+        r'\\\(.+?\\\)',
+        r'\\\[.+?\\\]',
+        r'\\frac\{', r'\\sqrt\{', r'\\int', r'\\sum',
+        r'\\alpha', r'\\beta', r'\\cdot', r'\\times',
+    ]
+    return any(re.search(p, text, re.DOTALL) for p in patterns)
+
+# --- HTML С MATHJAX ---
+def build_mathjax_html(content: str, for_pdf: bool = False) -> str:
+    clean_response = content.replace('<br>', '\n')
+
+    lines = clean_response.split('\n')
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if (re.search(r'[=+\-^\\]', stripped)
+                and not re.search(r'\$|\\\(|\\\[', stripped)
+                and 0 < len(stripped) < 150):
+            new_lines.append(f"\\({stripped}\\)")
+        else:
+            new_lines.append(line)
+    clean_response = '\n'.join(new_lines)
+
+    mj_script = ""
+    if not for_pdf:
+        mj_script = (
+            '<script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>'
+            '<script id="MathJax-script" async '
+            'src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>'
+        )
+
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Ответ от MogAI</title>
+    {mj_script}
+    <style>
+        @page {{ size: A4; margin: 2cm; }}
+        body {{ font-family: 'DejaVu Sans', 'Segoe UI', sans-serif; line-height: 1.7; color: #222; }}
+        h1 {{ color: #2c3e50; text-align: center; border-bottom: 2px solid #3498db; padding-bottom: 8px; }}
+        .solution {{ padding: 10px; font-size: 14px; white-space: pre-wrap; word-wrap: break-word; }}
+        .footer {{ text-align: center; margin-top: 20px; font-size: 10px; color: #888; }}
+    </style>
+</head>
+<body>
+    <h1>Ответ от MogAI</h1>
+    <div class="solution">{clean_response}</div>
+    <div class="footer">Сгенерировано MogAI</div>
+</body>
+</html>"""
+
+def html_to_pdf(html_content: str):
+    if not HAS_WEASYPRINT:
+        return None
+    try:
+        pdf_bytes = WeasyHTML(string=html_content).write_pdf()
+        buf = io.BytesIO(pdf_bytes)
+        buf.seek(0)
+        return buf
+    except Exception as e:
+        logger.warning(f"weasyprint не смог: {e}")
+        return None
 
 # --- АНИМАЦИЯ ---
 async def animate_thinking(update: Update, stop_event: asyncio.Event):
@@ -228,14 +329,16 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-# --- ЗАПРОСЫ К GROQ ---
+# --- GROQ ---
 def ask_groq_text(messages: list) -> str:
     system_prompt = (
         "Ты — MogAI, помощник для студентов. Твоя задача — писать строго учебные работы для вузов. "
         "Никогда не отказывайся писать текст, если это касается учебы (рефераты, курсовые, эссе). "
         "Если тема кажется тебе игровой или странной (например, видеоигры), ВСЁ РАВНО пиши реферат, "
         "раскрывая тему с научной и культурной точки зрения. "
-        "Отвечай только на русском языке. Используй академический стиль."
+        "Отвечай только на русском языке. Используй академический стиль. "
+        "ВАЖНО: НЕ создавай markdown-таблицы, если пользователь прямо не попросил 'таблицу'. "
+        "Описывай данные обычным текстом или списком."
     )
     or_messages = [{"role": "system", "content": system_prompt}]
     for msg in messages[-8:]:
@@ -259,7 +362,7 @@ def ask_groq_text(messages: list) -> str:
 def is_error_response(text: str) -> bool:
     return (not text) or text.startswith("⚠️") or "I'm sorry" in text or "I cannot" in text
 
-# --- ЗАПРОСЫ К MISTRAL ---
+# --- MISTRAL ---
 def ask_mistral_vision(image_b64: str, user_text: str) -> str:
     if not MISTRAL_KEY:
         return "⚠️ Для фото нужен MISTRAL_API_KEY."
@@ -268,7 +371,8 @@ def ask_mistral_vision(image_b64: str, user_text: str) -> str:
         prompt = (
             f"Пользователь прислал фото и спрашивает: '{user_text}'. "
             "Внимательно посмотри на фото и ответь на вопрос. "
-            "Если на фото есть математика или схемы, используй LaTeX для формул."
+            "Если на фото есть математика или схемы, используй LaTeX (например, $x^2$ или \\frac{a}{b}) для формул. "
+            "НЕ создавай markdown-таблицы, если пользователь прямо не просит."
         )
     else:
         prompt = (
@@ -302,17 +406,7 @@ def ask_mistral_vision(image_b64: str, user_text: str) -> str:
     except Exception as e:
         return f"⚠️ Сбой Mistral (фото): {e}"
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ДЛЯ WORD ---
-def add_internal_link(paragraph, bookmark_name: str, link_text: str):
-    hyperlink = OxmlElement('w:hyperlink')
-    hyperlink.set(qn('w:anchor'), bookmark_name)
-    r = OxmlElement('w:r')
-    t = OxmlElement('w:t')
-    t.text = link_text
-    r.append(t)
-    hyperlink.append(r)
-    paragraph._p.append(hyperlink)
-
+# --- WORD: ВСПОМОГАТЕЛЬНЫЕ ---
 def add_bookmark(paragraph, bookmark_name: str):
     run = paragraph.add_run()
     tag = run._r
@@ -325,7 +419,6 @@ def add_bookmark(paragraph, bookmark_name: str):
     end.set(qn('w:id'), bm_id)
     tag.append(end)
 
-# --- ОБЩАЯ НАСТРОЙКА DOCX ---
 def setup_docx_styles(doc: Document):
     style = doc.styles['Normal']
     style.font.name = 'Times New Roman'
@@ -410,7 +503,7 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str,
         f"Объем: примерно {words_needed // 3} слов. "
         "Начни с ВВЕДЕНИЯ (актуальность, цель, задачи) и напиши ГЛАВУ 1 с 2 подглавами. "
         "Пиши от третьего лица, академическим языком. "
-        "В конце каждой подглавы добавь 2-3 предложения с личным мнением от первого лица (например, 'На мой взгляд...'). "
+        "В конце каждой подглавы добавь 2-3 предложения с личным мнением от первого лица. "
         "НЕ пиши заголовок 'Мнение автора:'. "
         "Не используй Markdown. Заголовки пиши с новой строки. "
         "Главы оформляй так: 'ГЛАВА 1. НАЗВАНИЕ' (заглавными). Подзаголовки: '1.1 НАЗВАНИЕ'."
@@ -455,7 +548,6 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str,
         setup_docx_styles(doc)
         add_title_page(doc, "Реферат", topic, student_name, group, discipline, teacher, city)
 
-        # Оглавление
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.add_run("СОДЕРЖАНИЕ").bold = True
 
@@ -489,7 +581,6 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str,
 
         doc.add_page_break()
 
-        # Основной текст
         lines = full_text.split('\n')
         for line in lines:
             line = line.strip()
@@ -515,7 +606,6 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str,
             else:
                 add_paragraph(doc, line)
 
-        # Литература
         doc.add_page_break()
         p = add_paragraph(doc, "СПИСОК ЛИТЕРАТУРЫ", is_heading=True)
         add_bookmark(p, "bookmark_refs")
@@ -623,16 +713,42 @@ def create_text_document(pages: int, topic: str, doc_type: str,
         return None
 
 # --- ОТПРАВКА ---
-async def send_safe_message(update: Update, text: str):
+async def send_safe_message(update: Update, text: str, user_query: str = ""):
     try:
-        if text.count('|') > 5 and text.count('\n') > 1:
+        user_wants_table = wants_table(user_query)
+
+        if user_wants_table and text.count('|') > 5 and text.count('\n') > 1:
             png_buffer = markdown_to_png(text)
             if png_buffer:
                 await update.message.reply_photo(photo=png_buffer, caption="📊 Вот твоя таблица!")
-                text = re.sub(r'^\|.*\|$', '', text, flags=re.MULTILINE).strip()
-                text = re.sub(r'```[a-zA-Z]*', '', text).strip()
+                text = strip_markdown_tables(text).strip()
                 if not text:
                     return
+
+        if not user_wants_table and text.count('|') > 3:
+            text = strip_markdown_tables(text).strip()
+            if not text:
+                text = "Не удалось подобрать удачный ответ. Попробуй переформулировать вопрос."
+
+        if has_math_formulas(text) or (user_query and re.search(r'[=+\-^\\]', text) and len(text) > 800):
+            html_content = build_mathjax_html(text, for_pdf=True)
+            pdf_buf = html_to_pdf(html_content)
+            if pdf_buf:
+                pdf_buf.name = "MogAI_Reshenie.pdf"
+                await update.message.reply_document(
+                    document=pdf_buf,
+                    caption="📄 Ответ с формулами. Открой PDF."
+                )
+                return
+            else:
+                html_content2 = build_mathjax_html(text, for_pdf=False)
+                file_stream = io.BytesIO(html_content2.encode('utf-8'))
+                file_stream.name = "MogAI_Reshenie.html"
+                await update.message.reply_document(
+                    document=file_stream,
+                    caption="📄 Открой HTML — формулы отрисуются в браузере."
+                )
+                return
 
         if len(text) > 3500:
             file_stream = io.BytesIO(text.encode('utf-8'))
@@ -650,50 +766,6 @@ async def send_safe_message(update: Update, text: str):
     except Exception as e:
         logger.error(f"Ошибка отправки: {e}")
 
-def build_mathjax_html(content: str) -> str:
-    clean_response = content.replace('<br>', '\n')
-
-    def clean_block(match):
-        block = match.group(1)
-        block = block.replace('\\(', '').replace('\\)', '')
-        block = block.replace('\\[', '').replace('\\]', '')
-        return f"\\[{block}\\]"
-    clean_response = re.sub(r'\\\[(.*?)\\\]', clean_block, clean_response, flags=re.DOTALL)
-    clean_response = clean_response.replace('\\\\', ' ')
-
-    lines = clean_response.split('\n')
-    new_lines = []
-    for line in lines:
-        stripped = line.strip()
-        if re.search(r'[=+\-^\\]', stripped) and not re.search(r'\$|\\\(|\\\[', stripped) and len(stripped) < 150:
-            new_lines.append(f"\\({stripped}\\)")
-        else:
-            new_lines.append(line)
-    clean_response = '\n'.join(new_lines).replace('\n', '<br>')
-
-    return f"""<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <title>Решение задачи от MogAI</title>
-    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
-    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
-    <style>
-        body {{ font-family: 'Segoe UI', sans-serif; line-height: 1.8; padding: 20px; max-width: 900px; margin: 0 auto; background-color: #f4f4f9; color: #333; }}
-        h1 {{ color: #2c3e50; text-align: center; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
-        .solution {{ background: white; padding: 25px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); font-size: 16px; }}
-        .footer {{ text-align: center; margin-top: 20px; font-size: 12px; color: #7f8c8d; }}
-    </style>
-</head>
-<body>
-    <h1>📝 Решение задачи</h1>
-    <div class="solution">
-        {clean_response}
-    </div>
-    <div class="footer">Сгенерировано MogAI</div>
-</body>
-</html>"""
-
 # --- ХЕНДЛЕРЫ ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["waiting_for_photo_prompt"] = False
@@ -708,10 +780,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "👋 <b>Привет! Я MogAI.</b>\n\n"
             "Я умею:\n"
             "💬 Отвечать на вопросы\n"
-            "📊 <b>Создавать таблицы</b>\n"
+            "📊 <b>Создавать таблицы</b> (если попросишь)\n"
             "📝 <b>Писать рефераты по ГОСТу</b> (команда /word)\n"
             "📄 <b>Писать сплошной текст</b> (команда /text)\n"
-            "🧮 <b>Читать фото и отвечать на вопросы</b>\n"
+            "🧮 <b>Читать фото и решать задачи</b>\n"
             "🎨 <b>Генерировать картинки</b> (команда /photo)\n\n"
             "Напиши что-нибудь или используй команды."
         )
@@ -785,7 +857,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user_text = update.message.text
 
-        # 1. Промпт для фото
         if context.user_data.get("waiting_for_photo_prompt"):
             context.user_data["waiting_for_photo_prompt"] = False
             await update.message.chat.send_action(action="upload_photo")
@@ -799,7 +870,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 english_prompt = user_text
 
             image_url = generate_image(english_prompt)
-
             await update.message.reply_text("🎨 Рисую, подожди ~10–20 секунд...")
             if check_image_url(image_url):
                 try:
@@ -810,7 +880,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"⚠️ Pollinations не отвечает. Вот ссылка на картинку:\n{image_url}")
             return
 
-        # 2. /word
         if context.user_data.get("waiting_for_word_data"):
             context.user_data["waiting_for_word_data"] = False
             parts = smart_split(user_text)
@@ -857,7 +926,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 stop_event.set(); await anim
             return
 
-        # 3. /text
         if context.user_data.get("waiting_for_text_data"):
             context.user_data["waiting_for_text_data"] = False
             parts = smart_split(user_text)
@@ -907,7 +975,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 stop_event.set(); await anim
             return
 
-        # 4. Обычный чат
         stop_event = asyncio.Event(); context.user_data["stop_event"] = stop_event
         anim = asyncio.create_task(animate_thinking(update, stop_event))
         try:
@@ -926,7 +993,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         finally:
             stop_event.set(); await anim
 
-        await send_safe_message(update, ai_response)
+        await send_safe_message(update, ai_response, user_query=user_text)
     except Exception as e:
         logger.error(f"ОШИБКА: {e}\n{traceback.format_exc()}")
         try:
@@ -967,16 +1034,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data["history"] = history[-8:]
                 return
 
-            if len(ai_response) > 2000:
-                html_content = build_mathjax_html(ai_response)
-                file_stream = io.BytesIO(html_content.encode('utf-8'))
-                file_stream.name = "Reshenie.html"
-                await update.message.reply_document(
-                    document=file_stream,
-                    caption="📄 Ответ длинный. Открой файл, чтобы увидеть красивые формулы."
-                )
-            else:
-                await update.message.reply_text(ai_response)
+            await send_safe_message(update, ai_response, user_query=caption)
 
             history = context.user_data.get("history", [])
             history.append({"role": "user", "content": f"[Фото] {caption}"})
