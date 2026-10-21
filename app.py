@@ -46,13 +46,6 @@ MISTRAL_VISION_MODEL = "pixtral-12b-2409"
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 
 # --- КЛАВИАТУРЫ ---
-def get_main_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🆕 Новый чат", callback_data="new_chat")],
-        [InlineKeyboardButton("🔄 Сбросить (Reset)", callback_data="reset_confirm")],
-        [InlineKeyboardButton("❓ Помощь", callback_data="help")]
-    ])
-
 def get_reset_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Да, начать заново", callback_data="reset_yes")],
@@ -240,7 +233,7 @@ def add_bookmark(paragraph, bookmark_name: str):
     end.set(qn('w:id'), str(hash(bookmark_name) % 100000))
     tag.append(end)
 
-# --- СОЗДАНИЕ РЕФЕРАТА (БРОНЕБОЙНАЯ ВЕРСИЯ) ---
+# --- СОЗДАНИЕ РЕФЕРАТА ---
 def create_word_document(pages: int, topic: str, student_name: str, group: str, discipline: str, teacher: str, city: str) -> io.BytesIO:
     words_needed = pages * 300
     
@@ -463,19 +456,15 @@ def create_text_document(pages: int, topic: str, doc_type: str, student_name: st
     words_per_page = 300
     total_words_needed = pages * words_per_page
     
-    # Генерируем текст кусками по 3 страницы (900 слов), чтобы обойти лимиты
     chunk_size = 3
     chunks = (pages + chunk_size - 1) // chunk_size
     
     full_text = ""
     current_words = 0
     
-    logger.info(f"Начинаю генерацию текста на {pages} страниц ({chunks} кусков)...")
-    
     for i in range(chunks):
         words_for_chunk = min(chunk_size * words_per_page, total_words_needed - current_words)
-        if words_for_chunk <= 0:
-            break
+        if words_for_chunk <= 0: break
             
         if i == 0:
             prompt = (
@@ -504,15 +493,12 @@ def create_text_document(pages: int, topic: str, doc_type: str, student_name: st
             part_words = len(part.split())
             full_text += part + "\n\n"
             current_words += part_words
-            logger.info(f"Кусок {i+1}/{chunks}: получено {part_words} слов. Всего: {current_words}/{total_words_needed}")
         else:
-            logger.warning(f"Кусок {i+1}/{chunks}: ИИ отказался, ставлю заглушку.")
             stub = f"Текст по теме '{topic}'. " * 100
             full_text += stub + "\n\n"
             current_words += len(stub.split())
     
     if current_words < total_words_needed:
-        logger.warning(f"Текста не хватило ({current_words} из {total_words_needed}). Добиваю...")
         stub = f"Дополнительный текст по теме '{topic}'. " * 100
         full_text += stub + "\n\n"
     
@@ -537,7 +523,6 @@ def create_text_document(pages: int, topic: str, doc_type: str, student_name: st
             section.top_margin = Cm(2)
             section.bottom_margin = Cm(2)
 
-        # Титульник (если есть ФИО)
         if student_name:
             p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             run = p.add_run("МИНИСТЕРСТВО ОБРАЗОВАНИЯ И НАУКИ\nРОССИЙСКОЙ ФЕДЕРАЦИИ"); run.bold = True
@@ -579,7 +564,6 @@ def create_text_document(pages: int, topic: str, doc_type: str, student_name: st
             
             doc.add_page_break()
 
-        # Сам текст (сплошной)
         lines = full_text.split('\n')
         for line in lines:
             line = line.strip()
@@ -622,19 +606,27 @@ async def send_safe_message(update: Update, text: str):
 
 # --- ХЕНДЛЕРЫ ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["history"] = []
-    text = (
-        "👋 <b>Привет! Я MogAI.</b>\n\n"
-        "Я умею:\n"
-        "💬 Отвечать на вопросы\n"
-        "📊 <b>Создавать таблицы</b>\n"
-        "📝 <b>Писать рефераты по ГОСТу</b> (команда /word)\n"
-        "📄 <b>Писать сплошной текст</b> (команда /text)\n"
-        "🧮 <b>Читать фото и отвечать на вопросы</b>\n"
-        "🎨 <b>Генерировать картинки</b> (команда /photo)\n\n"
-        "Напиши что-нибудь или используй команды."
-    )
-    await update.message.reply_text(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
+    # Проверяем, есть ли уже история    history = context.user_data.get("history", [])
+    
+    if history:
+        text = (
+            "🤖 <b>Я уже запущен!</b>\n\n"
+            "Задавай свои вопросы. Я помню контекст нашего разговора."
+        )
+    else:
+        text = (
+            "👋 <b>Привет! Я MogAI.</b>\n\n"
+            "Я умею:\n"
+            "💬 Отвечать на вопросы\n"
+            "📊 <b>Создавать таблицы</b>\n"
+            "📝 <b>Писать рефераты по ГОСТу</b> (команда /word)\n"
+            "📄 <b>Писать сплошной текст</b> (команда /text)\n"
+            "🧮 <b>Читать фото и отвечать на вопросы</b>\n"
+            "🎨 <b>Генерировать картинки</b> (команда /photo)\n\n"
+            "Напиши что-нибудь или используй команды."
+        )
+    
+    await update.message.reply_text(text, parse_mode="HTML")
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⚠️ <b>Вы уверены?</b>", reply_markup=get_reset_keyboard(), parse_mode="HTML")
@@ -682,15 +674,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⚠️ Вы уверены?", reply_markup=get_reset_keyboard(), parse_mode="HTML")
     elif query.data == "reset_yes":
         context.user_data["history"] = []
-        await query.edit_message_text("🧹 История очищена.", reply_markup=get_main_keyboard())
+        await query.edit_message_text("🧹 История очищена.", parse_mode="HTML")
     elif query.data == "reset_no":
-        await query.edit_message_text("👍 Отмена.", reply_markup=get_main_keyboard())
-    elif query.data == "new_chat":
-        context.user_data["history"] = []
-        await query.edit_message_text("🧹 Новый чат!", reply_markup=get_main_keyboard())
-    elif query.data == "help":
-        text = "🤖 <b>Команды:</b>\n• /reset — сброс\n• /photo — нарисовать картинку\n• /word — реферат по ГОСТу\n• /text — сплошной текст\n• Пришли фото с вопросом."
-        await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
+        await query.edit_message_text("👍 Отмена.", parse_mode="HTML")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
