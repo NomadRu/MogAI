@@ -244,7 +244,6 @@ def add_bookmark(paragraph, bookmark_name: str):
 def create_word_document(pages: int, topic: str, student_name: str, group: str, discipline: str, teacher: str, city: str) -> io.BytesIO:
     words_needed = pages * 300
     
-    # Часть 1: Введение + Глава 1
     prompt1 = (
         f"Напиши первую часть академического реферата на тему: '{topic}'. "
         f"Объем: примерно {words_needed // 3} слов. "
@@ -257,7 +256,6 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
     )
     part1 = ask_groq_text([{"role": "user", "content": prompt1}])
     
-    # Часть 2: Глава 2
     prompt2 = (
         f"Продолжи академический реферат на тему: '{topic}'. Напиши ГЛАВУ 2 с 2 подглавами. "
         f"Объем: примерно {words_needed // 3} слов. "
@@ -269,7 +267,6 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
     )
     part2 = ask_groq_text([{"role": "user", "content": prompt2}])
     
-    # Часть 3: Глава 3 + Заключение
     prompt3 = (
         f"Заверши академический реферат на тему: '{topic}'. Напиши ГЛАВУ 3 с 2 подглавами и ЗАКЛЮЧЕНИЕ. "
         f"Объем: примерно {words_needed // 3} слов. "
@@ -281,41 +278,14 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
     )
     part3 = ask_groq_text([{"role": "user", "content": prompt3}])
 
-    # Проверка на ошибки и подстановка заглушек
     if not part1 or "⚠️" in part1 or "I'm sorry" in part1:
-        part1 = (
-            f"ВВЕДЕНИЕ\n"
-            f"Тема '{topic}' является актуальной. Цель работы — изучить основные аспекты.\n"
-            f"ГЛАВА 1. ОСНОВНЫЕ ПОНЯТИЯ\n"
-            f"1.1 Определение и суть\n"
-            f"В данном разделе рассматриваются базовые понятия. На мой взгляд, это важно.\n"
-            f"1.2 История развития\n"
-            f"История вопроса уходит корнями в прошлое. Я считаю, что это интересно.\n"
-        )
-    
+        part1 = f"ВВЕДЕНИЕ\nТема '{topic}' актуальна.\nГЛАВА 1. ОСНОВЫ\n1.1 Начало\nТекст..."
     if not part2 or "⚠️" in part2 or "I'm sorry" in part2:
-        part2 = (
-            f"ГЛАВА 2. АНАЛИЗ\n"
-            f"2.1 Современное состояние\n"
-            f"На сегодняшний день ситуация выглядит следующим образом.\n"
-            f"2.2 Перспективы\n"
-            f"В будущем ожидается дальнейшее развитие.\n"
-        )
-    
+        part2 = f"ГЛАВА 2. АНАЛИЗ\n2.1 Суть\nТекст...\n2.2 Детали\nТекст..."
     if not part3 or "⚠️" in part3 or "I'm sorry" in part3:
-        part3 = (
-            f"ГЛАВА 3. ПРАКТИКА\n"
-            f"3.1 Примеры\n"
-            f"Приведены примеры использования.\n"
-            f"3.2 Рекомендации\n"
-            f"Даны рекомендации по применению.\n"
-            f"ЗАКЛЮЧЕНИЕ\n"
-            f"В ходе работы были сделаны выводы.\n"
-        )
+        part3 = f"ГЛАВА 3. ПРАКТИКА\n3.1 Примеры\nТекст...\nЗАКЛЮЧЕНИЕ\nВыводы..."
 
     full_text = part1 + "\n" + part2 + "\n" + part3
-    
-    # Очистка от артефактов
     full_text = re.sub(r'[*#_`~]', '', full_text)
     full_text = "".join(c for c in full_text if c.isprintable() or c in '\n\r\t')
 
@@ -488,6 +458,130 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
         logger.error(f"Ошибка сборки Word: {e}")
         return None
 
+# --- СОЗДАНИЕ ТЕКСТА (КОМАНДА /text) ---
+def create_text_document(pages: int, topic: str, doc_type: str, student_name: str = "", group: str = "", discipline: str = "", teacher: str = "", city: str = "") -> io.BytesIO:
+    words_per_page = 300
+    total_words = pages * words_per_page
+    
+    # Генерируем текст частями по 10 страниц (3000 слов), чтобы не упереться в лимит
+    chunk_pages = 10
+    chunks = (pages + chunk_pages - 1) // chunk_pages
+    
+    full_text = ""
+    for i in range(chunks):
+        current_pages = min(chunk_pages, pages - i * chunk_pages)
+        current_words = current_pages * words_per_page
+        
+        if i == 0:
+            prompt = (
+                f"Напиши начало {doc_type} на тему: '{topic}'. "
+                f"Объем: примерно {current_words} слов. "
+                "Пиши связным академическим текстом, без заголовков и списков, как сплошной текст. "
+                "Раскрой актуальность, основные понятия и начни анализ темы."
+            )
+        elif i == chunks - 1:
+            prompt = (
+                f"Заверши {doc_type} на тему: '{topic}'. "
+                f"Объем: примерно {current_words} слов. "
+                "Пиши связным академическим текстом, без заголовков и списков. "
+                "Сделай выводы и заключение."
+            )
+        else:
+            prompt = (
+                f"Продолжи {doc_type} на тему: '{topic}'. "
+                f"Объем: примерно {current_words} слов. "
+                "Пиши связным академическим текстом, без заголовков и списков. "
+                "Продолжи анализ темы, раскрой детали."
+            )
+        
+        part = ask_groq_text([{"role": "user", "content": prompt}])
+        if part and "⚠️" not in part and "I'm sorry" not in part:
+            full_text += part + "\n\n"
+        else:
+            # Заглушка, если ИИ отказал
+            full_text += f"Текст по теме '{topic}' (часть {i+1}). " * 50 + "\n\n"
+    
+    full_text = re.sub(r'[*#_`~]', '', full_text)
+    full_text = "".join(c for c in full_text if c.isprintable() or c in '\n\r\t')
+
+    try:
+        doc = Document()
+        
+        style = doc.styles['Normal']
+        style.font.name = 'Times New Roman'
+        style.font.size = Pt(14)
+        style.paragraph_format.line_spacing_rule = WD_LINE_SPACING.ONE_POINT_FIVE
+        style.paragraph_format.space_after = Pt(0)
+        style.paragraph_format.space_before = Pt(0)
+        style.paragraph_format.first_line_indent = Cm(1.25)
+        style.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+
+        for section in doc.sections:
+            section.left_margin = Cm(3)
+            section.right_margin = Cm(1.5)
+            section.top_margin = Cm(2)
+            section.bottom_margin = Cm(2)
+
+        # Титульник (упрощенный)
+        if student_name:
+            p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = p.add_run("МИНИСТЕРСТВО ОБРАЗОВАНИЯ И НАУКИ\nРОССИЙСКОЙ ФЕДЕРАЦИИ"); run.bold = True
+            p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = p.add_run("ФЕДЕРАЛЬНОЕ ГОСУДАРСТВЕННОЕ БЮДЖЕТНОЕ\nОБРАЗОВАТЕЛЬНОЕ УЧРЕЖДЕНИЕ\nВЫСШЕГО ОБРАЗОВАНИЯ"); run.bold = True
+            p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = p.add_run("«ПОВОЛЖСКИЙ ГОСУДАРСТВЕННЫЙ\nТЕХНОЛОГИЧЕСКИЙ УНИВЕРСИТЕТ» (ФГБОУ ВО\n«ПГТУ») ВЫСШИЙ КОЛЛЕДЖ ПГТУ «Политехник»"); run.bold = True
+            
+            for _ in range(4): doc.add_paragraph()
+            
+            p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p.add_run(doc_type.capitalize()).bold = True
+            p.runs[0].font.size = Pt(20)
+            
+            p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p.add_run(f"по дисциплине «{discipline}»")
+            
+            for _ in range(2): doc.add_paragraph()
+            
+            p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p.add_run("на тему:")
+            
+            p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p.add_run(f"«{topic}»").bold = True
+            p.runs[0].font.size = Pt(16)
+            
+            for _ in range(6): doc.add_paragraph()
+            
+            p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            p.add_run(f"Выполнил: обучающийся\nгруппы {group}\n{student_name}")
+            
+            p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            p.add_run(f"Преподаватель: {teacher}")
+            
+            for _ in range(8): doc.add_paragraph()
+            
+            p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p.add_run(f"{city}, 2026")
+            
+            doc.add_page_break()
+
+        # Сам текст (сплошной)
+        lines = full_text.split('\n')
+        for line in lines:
+            line = line.strip()
+            if not line: continue
+            p = doc.add_paragraph(line)
+            p.paragraph_format.line_spacing_rule = WD_LINE_SPACING.ONE_POINT_FIVE
+            p.paragraph_format.first_line_indent = Cm(1.25)
+            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+
+        buf = io.BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+        return buf
+    except Exception as e:
+        logger.error(f"Ошибка сборки Text: {e}")
+        return None
+
 # --- ОТПРАВКА ---
 async def send_safe_message(update: Update, text: str):
     try:
@@ -520,6 +614,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💬 Отвечать на вопросы\n"
         "📊 <b>Создавать таблицы</b>\n"
         "📝 <b>Писать рефераты по ГОСТу</b> (команда /word)\n"
+        "📄 <b>Писать сплошной текст</b> (команда /text)\n"
         "🧮 <b>Читать фото и отвечать на вопросы</b>\n"
         "🎨 <b>Генерировать картинки</b> (команда /photo)\n\n"
         "Напиши что-нибудь или используй команды."
@@ -549,6 +644,20 @@ async def word_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
+async def text_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["waiting_for_text_data"] = True
+    text = (
+        "📄 <b>Создание сплошного текста.</b>\n\n"
+        "Отправь данные <b>одним сообщением</b> через запятую в таком порядке:\n"
+        "<b>Страницы (до 50), Тема, Тип (доклад/реферат/биография/сочинение)</b>\n\n"
+        "Пример:\n"
+        "<i>30, История космонавтики, доклад</i>\n\n"
+        "Если хочешь с титульником, добавь ещё: ФИО, Группа, Дисциплина, Преподаватель, Город.\n"
+        "Пример с титульником:\n"
+        "<i>30, История космонавтики, доклад, Иванов И.И., ИВТ-21, Астрономия, Петров П.П., Москва</i>"
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query.data == "stop_thinking":
@@ -565,7 +674,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["history"] = []
         await query.edit_message_text("🧹 Новый чат!", reply_markup=get_main_keyboard())
     elif query.data == "help":
-        text = "🤖 <b>Команды:</b>\n• /reset — сброс\n• /photo — нарисовать картинку\n• /word — создать реферат по ГОСТу\n• Пришли фото с вопросом."
+        text = "🤖 <b>Команды:</b>\n• /reset — сброс\n• /photo — нарисовать картинку\n• /word — реферат по ГОСТу\n• /text — сплошной текст\n• Пришли фото с вопросом."
         await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -585,7 +694,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if "⚠️" in english_prompt: english_prompt = user_text
             
             image_url = generate_image(english_prompt)
-            await update.message.reply_photo(photo=image_url, caption=f"🎨 Вот что я нарисовал: <i>{user_text}</i>", parse_mode="HTML")
+            await update.message.reply_photo(photo=image_url, caption=f"🎨 Вот что я нарисовал: {user_text}", parse_mode="HTML")
             return
 
         # 2. Ждем данные для /word
@@ -626,10 +735,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_document(
                         document=docx_buffer, 
                         filename=f"Referat_{topic[:15]}.docx", 
-                        caption=f"📝 Реферат по ГОСТу: <b>{topic}</b> ({pages} стр.)\n"
-                                f"Студент: {student_name}\n"
-                                f"Группа: {group}\n"
-                                f"Дисциплина: {discipline}"
+                        caption=f"Реферат по ГОСТу: {topic} ({pages} стр.)"
                     )
                 else:
                     await update.message.reply_text("⚠️ Не удалось создать реферат. Попробуйте позже.")
@@ -637,7 +743,56 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 stop_event.set(); await anim
             return
 
-        # 3. Обычная логика текста
+        # 3. Ждем данные для /text
+        if context.user_data.get("waiting_for_text_data"):
+            context.user_data["waiting_for_text_data"] = False
+            
+            parts = [p.strip() for p in user_text.split(',')]
+            if len(parts) < 3:
+                await update.message.reply_text("⚠️ Нужно минимум 3 параметра: Страницы, Тема, Тип. Попробуй еще раз: /text", parse_mode="HTML")
+                return
+            
+            try:
+                pages = int(parts[0])
+            except:
+                pages = 10
+            topic = parts[1]
+            doc_type = parts[2]
+            
+            # Если есть дополнительные данные для титульника
+            student_name = parts[3] if len(parts) > 3 else ""
+            group = parts[4] if len(parts) > 4 else ""
+            discipline = parts[5] if len(parts) > 5 else ""
+            teacher = parts[6] if len(parts) > 6 else ""
+            city = parts[7] if len(parts) > 7 else ""
+            
+            if pages > 50:
+                pages = 50
+            
+            stop_event = asyncio.Event(); context.user_data["stop_event"] = stop_event
+            anim = asyncio.create_task(animate_thinking(update, stop_event))
+            
+            try:
+                await update.message.chat.send_action(action="upload_document")
+                docx_buffer = await asyncio.to_thread(
+                    create_text_document, pages, topic, doc_type, student_name, group, discipline, teacher, city
+                )
+                
+                if stop_event.is_set(): return
+                
+                if docx_buffer:
+                    await update.message.reply_document(
+                        document=docx_buffer, 
+                        filename=f"{doc_type.capitalize()}_{topic[:15]}.docx", 
+                        caption=f"{doc_type.capitalize()}: {topic} ({pages} стр.)"
+                    )
+                else:
+                    await update.message.reply_text("⚠️ Не удалось создать текст. Попробуйте позже.")
+            finally:
+                stop_event.set(); await anim
+            return
+
+        # 4. Обычная логика текста
         lower_text = user_text.lower()
         
         stop_event = asyncio.Event(); context.user_data["stop_event"] = stop_event
@@ -756,6 +911,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CommandHandler("photo", photo_command))
     app.add_handler(CommandHandler("word", word_command))
+    app.add_handler(CommandHandler("text", text_command))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
