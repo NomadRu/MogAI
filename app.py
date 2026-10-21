@@ -58,6 +58,33 @@ def get_reset_keyboard():
 def get_stop_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Остановить", callback_data="stop_thinking")]])
 
+# --- РЕНДЕР ФОРМУЛ В КАРТИНКИ (СЕРВЕРНЫЙ) ---
+def render_latex_to_base64(latex: str) -> str:
+    """Превращает LaTeX-формулу в base64-картинку через matplotlib"""
+    if not HAS_MATPLOTLIB:
+        return ""
+    try:
+        # Очищаем формулу от лишних символов
+        latex = latex.strip()
+        if not latex:
+            return ""
+        
+        # Настраиваем matplotlib для рендера формул
+        fig = plt.figure(figsize=(0.01, 0.01))
+        fig.text(0, 0, f"${latex}$", fontsize=14, color='black')
+        
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0.1, dpi=150, transparent=False, facecolor='white')
+        buf.seek(0)
+        plt.close(fig)
+        
+        # Конвертируем в base64
+        img_base64 = base64.b64encode(buf.read()).decode('utf-8')
+        return img_base64
+    except Exception as e:
+        logger.error(f"Ошибка рендера формулы: {e}")
+        return ""
+
 # --- ПАРСЕР ТАБЛИЦ В PNG ---
 def markdown_to_png(text: str) -> io.BytesIO:
     if not HAS_MATPLOTLIB: return None
@@ -386,38 +413,41 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data["history"] = history[-8:]
                 return
 
-            # Очистка формул от лишнего и обертка в $...$, если забыл
+            # --- СЕРВЕРНЫЙ РЕНДЕР ФОРМУЛ ---
             clean_ai_response = ai_response.replace('<br>', '\n')
             
-            # Автоматическая обертка формул, если ИИ забыл поставить $ или \( \)
-            # Ищем выражения с математическими символами и оборачиваем
-            lines = clean_ai_response.split('\n')
-            new_lines = []
-            for line in lines:
-                # Если в строке есть признаки формулы и нет тегов MathJax
-                if re.search(r'[=+\-^\\]', line) and not re.search(r'\$|\\\(|\\\[', line):
-                    # Оборачиваем всю строку в \( \), если это похоже на формулу
-                    if len(line) < 100 and not line.strip().endswith('.'):
-                        line = f"\\({line}\\)"
-                new_lines.append(line)
-            clean_ai_response = '\n'.join(new_lines)
+            # Находим все формулы в тексте и рендерим их в картинки
+            def replace_formula(match):
+                formula = match.group(1) or match.group(2) or match.group(3)
+                if not formula:
+                    return match.group(0)
+                
+                img_b64 = render_latex_to_base64(formula)
+                if img_b64:
+                    return f'<img src="data:image/png;base64,{img_b64}" style="vertical-align: middle; max-width: 100%;" alt="{formula}">'
+                return match.group(0)
+            
+            # Ищем формулы в \( ... \), \[ ... \], $...$
+            clean_ai_response = re.sub(
+                r'\\\((.*?)\\\)|\\\[(.*?)\\\]|\$(.*?)\$',
+                replace_formula,
+                clean_ai_response,
+                flags=re.DOTALL
+            )
+            
+            # Обертка для остального текста
+            clean_ai_response = clean_ai_response.replace('\n', '<br>')
 
             html_content = f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
     <title>Решение задачи от MogAI</title>
-    <script>
-        MathJax = {{
-            tex: {{ inlineMath: [['$', '$'], ['\\(', '\\)']] }},
-            svg: {{ fontCache: 'global' }}
-        }};
-    </script>
-    <script type="text/javascript" id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
     <style>
-        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; padding: 20px; max-width: 900px; margin: 0 auto; background-color: #f4f4f9; color: #333; }}
+        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.8; padding: 20px; max-width: 900px; margin: 0 auto; background-color: #f4f4f9; color: #333; }}
         h1 {{ color: #2c3e50; text-align: center; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
-        .solution {{ background: white; padding: 25px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); font-size: 18px; line-height: 1.8; }}
+        .solution {{ background: white; padding: 25px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); font-size: 18px; }}
+        img {{ max-width: 100%; height: auto; }}
         .footer {{ text-align: center; margin-top: 20px; font-size: 12px; color: #7f8c8d; }}
     </style>
 </head>
@@ -432,7 +462,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             file_stream = io.BytesIO(html_content.encode('utf-8'))
             file_stream.name = "Reshenie.html"
-            await update.message.reply_document(document=file_stream, caption="📄 Вот HTML-файл с решением задачи! Открой его в браузере, чтобы увидеть красивые формулы.")
+            await update.message.reply_document(document=file_stream, caption="📄 Вот HTML-файл с решением! Формулы встроены как картинки и видны на любом устройстве.")
             
             history = context.user_data.get("history", [])
             history.append({"role": "user", "content": f"[Фото задачи] {caption}"})
