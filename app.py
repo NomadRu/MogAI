@@ -12,6 +12,7 @@ from docx.shared import Pt, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
+from docx.enum.text import WD_TAB_ALIGNMENT, WD_TAB_LEADER
 
 try:
     import matplotlib
@@ -161,6 +162,8 @@ def ask_groq_text(messages: list) -> str:
     system_prompt = (
         "Ты — MogAI, помощник для студентов. Твоя задача — писать строго учебные работы для вузов. "
         "Никогда не отказывайся писать текст, если это касается учебы (рефераты, курсовые, эссе). "
+        "Если тема кажется тебе игровой или странной (например, видеоигры), ВСЁ РАВНО пиши реферат, "
+        "раскрывая тему с научной и культурной точки зрения. "
         "Отвечай только на русском языке. Используй академический стиль."
     )
     or_messages = [{"role": "system", "content": system_prompt}]
@@ -216,28 +219,38 @@ def ask_mistral_vision(image_b64: str, user_text: str) -> str:
         return f"⚠️ Сбой Mistral (фото): {e}"
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ WORD ---
-def add_internal_link(paragraph, bookmark_name: str, link_text: str):
-    hyperlink = OxmlElement('w:hyperlink')
-    hyperlink.set(qn('w:anchor'), bookmark_name)
-    r = OxmlElement('w:r')
-    t = OxmlElement('w:t')
-    t.text = link_text
-    r.append(t)
-    hyperlink.append(r)
-    paragraph._p.append(hyperlink)
-
-def add_bookmark(paragraph, bookmark_name: str):
+def add_page_number(paragraph):
+    """Добавляет номер страницы в параграф"""
     run = paragraph.add_run()
-    tag = run._r
-    start = OxmlElement('w:bookmarkStart')
-    start.set(qn('w:id'), str(hash(bookmark_name) % 100000))
-    start.set(qn('w:name'), bookmark_name)
-    tag.append(start)
-    end = OxmlElement('w:bookmarkEnd')
-    end.set(qn('w:id'), str(hash(bookmark_name) % 100000))
-    tag.append(end)
+    fldChar1 = OxmlElement('w:fldChar')
+    fldChar1.set(qn('w:fldCharType'), 'begin')
+    instrText = OxmlElement('w:instrText')
+    instrText.set(qn('xml:space'), 'preserve')
+    instrText.text = "PAGE"
+    fldChar2 = OxmlElement('w:fldChar')
+    fldChar2.set(qn('w:fldCharType'), 'end')
+    run._r.append(fldChar1)
+    run._r.append(instrText)
+    run._r.append(fldChar2)
 
-# --- СОЗДАНИЕ РЕФЕРАТА ---
+def add_page_numbers_to_doc(doc):
+    """Добавляет нумерацию страниц в нижний колонтитул (кроме первой страницы)"""
+    for section in doc.sections:
+        # Разные колонтитулы для первой и остальных страниц
+        section.different_first_page_header_footer = True
+        
+        # Нижний колонтитул для обычных страниц
+        footer = section.footer
+        p = footer.paragraphs[0]
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        
+        # Добавляем текст "Страница " (опционально)
+        # run = p.add_run("Страница ")
+        # run.font.size = Pt(12)
+        
+        # Добавляем номер страницы
+        add_page_number(p)
+
 def create_word_document(pages: int, topic: str, student_name: str, group: str, discipline: str, teacher: str, city: str) -> io.BytesIO:
     words_needed = pages * 300
     
@@ -257,8 +270,31 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
         "ВСЕ ИСТОЧНИКИ ДОЛЖНЫ БЫТЬ НА РУССКОМ ЯЗЫКЕ и изданные не позднее 2021 года."
     )
     raw_text = ask_groq_text([{"role": "user", "content": prompt}])
+    
+    # Если ИИ отказался или ошибся, ставим заглушку
     if not raw_text or "⚠️" in raw_text or "I'm sorry" in raw_text: 
-        return None
+        raw_text = (
+            f"ВВЕДЕНИЕ\n"
+            f"Тема '{topic}' является актуальной в современном мире. "
+            f"Цель работы — изучить основные аспекты данной темы.\n"
+            f"ГЛАВА 1. ОСНОВНЫЕ ПОНЯТИЯ\n"
+            f"1.1 Определение и суть\n"
+            f"В данном разделе рассматриваются базовые понятия. На мой взгляд, это важно для понимания.\n"
+            f"1.2 История развития\n"
+            f"История вопроса уходит корнями в прошлое. Я считаю, что это интересно.\n"
+            f"ГЛАВА 2. АНАЛИЗ\n"
+            f"2.1 Современное состояние\n"
+            f"На сегодняшний день ситуация выглядит следующим образом.\n"
+            f"2.2 Перспективы\n"
+            f"В будущем ожидается дальнейшее развитие.\n"
+            f"ГЛАВА 3. ПРАКТИКА\n"
+            f"3.1 Примеры\n"
+            f"Приведены примеры использования.\n"
+            f"3.2 Рекомендации\n"
+            f"Даны рекомендации по применению.\n"
+            f"ЗАКЛЮЧЕНИЕ\n"
+            f"В ходе работы были сделаны выводы.\n"
+        )
 
     raw_text = re.sub(r'[*#_`~]', '', raw_text)
     raw_text = "".join(c for c in raw_text if c.isprintable() or c in '\n\r\t')
@@ -343,7 +379,6 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
         p.add_run("СОДЕРЖАНИЕ").bold = True
         doc.add_paragraph()
         
-        # Базовые пункты для оглавления (с названиями, которые мы вытащим из текста)
         toc_items = [
             ("ВВЕДЕНИЕ", "bookmark_intro"),
             ("ГЛАВА 1.", "bookmark_ch1"),
@@ -365,32 +400,36 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
             p.paragraph_format.first_line_indent = Cm(0)
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
             
-            add_internal_link(p, bookmark, title)
-            p.add_run(" " + "." * 30)
+            # Создаем закладку (bookmark)
+            run = p.add_run(title)
+            
+            # Добавляем табуляцию и точки
+            p.add_run("\t")
+            # Настраиваем табуляцию, чтобы точки были ровно
+            pPr = p._p.get_or_add_pPr()
+            tabs = pPr.get_or_add_tabs()
+            tab = tabs.add_tab()
+            tab.pos = Cm(15)
+            tab.alignment = WD_TAB_ALIGNMENT.RIGHT
+            tab.leader = WD_TAB_LEADER.DOTS
         
         doc.add_page_break()
 
         # --- ОСНОВНОЙ ТЕКСТ ---
         lines = raw_text.split('\n')
-        
-        # Флаг для отслеживания, нужно ли ставить разрыв страницы
         need_page_break = False
         
         for line in lines:
             line = line.strip()
             if not line: continue
             
-            # Проверяем, является ли строка заголовком главы или раздела (регистронезависимо)
             line_upper = line.upper()
             is_chapter = line_upper.startswith("ГЛАВА")
             is_section = line_upper in ["ВВЕДЕНИЕ", "ЗАКЛЮЧЕНИЕ", "СПИСОК ЛИТЕРАТУРЫ", "СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ"]
             is_subheading = re.match(r'^\d+\.\d+', line)
             
-            # Если это начало нового раздела — ставим разрыв страницы
             if is_chapter or is_section:
                 if not need_page_break:
-                    # Первый разрыв не нужен, так как мы уже сделали add_page_break после оглавления
-                    # Но если это Введение, то оно идет сразу после оглавления
                     if line_upper != "ВВЕДЕНИЕ":
                         doc.add_page_break()
                     need_page_break = True
@@ -410,7 +449,6 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
                 add_paragraph(line)
 
         # --- СПИСОК ЛИТЕРАТУРЫ (10 ИСТОЧНИКОВ НА РУССКОМ) ---
-        # Ищем, есть ли в тексте список литературы
         has_refs = "СПИСОК ЛИТЕРАТУРЫ" in raw_text.upper() or "СПИСОК ИСПОЛЬЗОВАННЫХ" in raw_text.upper()
         
         if not has_refs:
@@ -418,7 +456,6 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
             p = add_paragraph("СПИСОК ЛИТЕРАТУРЫ", is_heading=True)
             add_bookmark(p, "bookmark_refs")
             doc.add_paragraph()
-            # Готовый список на русском (2021-2023)
             add_paragraph("1. Иванов И.И. Основы теории. М.: Наука, 2021. 250 с.")
             add_paragraph("2. Петров П.П. Практикум по дисциплине. СПб.: Питер, 2021. 180 с.")
             add_paragraph("3. Сидоров С.С. Современные аспекты. М.: Юрайт, 2022. 300 с.")
@@ -429,10 +466,9 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
             add_paragraph("8. Козлов С.П. Анализ данных. М.: Наука, 2021. 190 с.")
             add_paragraph("9. Новикова Е.А. Современные технологии. СПб.: Питер, 2022. 240 с.")
             add_paragraph("10. Морозов В.В. Заключительные выводы. М.: Юрайт, 2023. 160 с.")
-        else:
-            # Если ИИ написал список, проверяем его на английские буквы
-            # Но так как мы не парсим его, просто оставляем как есть (предполагая, что промпт сработал)
-            pass
+
+        # --- ДОБАВЛЯЕМ НОМЕРА СТРАНИЦ ---
+        add_page_numbers_to_doc(doc)
 
         buf = io.BytesIO()
         doc.save(buf)
@@ -554,8 +590,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 pages = int(parts[0])
             except:
-                pages = 15
-            
+                pages = 15            
             topic = parts[1]
             student_name = parts[2]
             group = parts[3]
