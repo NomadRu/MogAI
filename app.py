@@ -9,6 +9,7 @@ import secrets
 import zlib
 import traceback
 import html
+from datetime import datetime, timezone, timedelta
 from docx import Document
 from docx.shared import Pt, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
@@ -16,7 +17,6 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from docx.enum.text import WD_TAB_ALIGNMENT, WD_TAB_LEADER
 
-# --- БИБЛИОТЕКИ ДЛЯ ГРАФИКИ И PDF ---
 try:
     import matplotlib
     matplotlib.use('Agg')
@@ -24,12 +24,6 @@ try:
     HAS_MATPLOTLIB = True
 except Exception:
     HAS_MATPLOTLIB = False
-
-try:
-    import cairosvg
-    HAS_CAIROSVG = True
-except Exception:
-    HAS_CAIROSVG = False
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -50,7 +44,8 @@ if not TOKEN or not GROQ_KEY:
 
 # --- КОНСТАНТЫ ---
 WORDS_PER_PAGE = 280
-GROQ_TEXT_MODELS = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "openai/gpt-oss-20b"]
+# Для поиска используем gpt-oss-20b (поддерживает browser_search)
+GROQ_TEXT_MODELS = ["openai/gpt-oss-20b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 MISTRAL_VISION_MODEL = "pixtral-12b-2409"
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
@@ -231,116 +226,34 @@ def has_math_formulas(text: str) -> bool:
     ]
     return any(re.search(p, text, re.DOTALL) for p in patterns)
 
-# --- РЕНДЕР ФОРМУЛ И СБОРКА PDF ---
-def render_latex_to_svg(latex_str: str, fontsize: int = 14) -> str | None:
-    if not HAS_MATPLOTLIB:
-        return None
-    latex_str = latex_str.strip()
-    for pattern in [r'^\$\$(.+?)\$\$$', r'^\$(.+?)\$$', r'^\\\[(.+?)\\\]$', r'^\\\((.+?)\\\)$']:
-        m = re.match(pattern, latex_str, re.DOTALL)
-        if m:
-            latex_str = m.group(1).strip()
-            break
-    if not latex_str:
-        return None
-    try:
-        fig = plt.figure(figsize=(0.1, 0.1))
-        fig.patch.set_alpha(0.0)
-        fig.text(0, 0, f"${latex_str}$", fontsize=fontsize, color='black')
-        svg_buf = io.StringIO()
-        fig.savefig(svg_buf, format='svg', bbox_inches='tight', pad_inches=0.02, transparent=True, facecolor='none')
-        plt.close(fig)
-        return svg_buf.getvalue()
-    except Exception as e:
-        logger.warning(f"Не удалось отрендерить формулу: {e}")
-        return None
-
-def build_pdf_with_formulas(text: str, fontsize: int = 14) -> io.BytesIO | None:
-    if not HAS_CAIROSVG:
-        return None
-    formula_pattern = re.compile(r'(\$\$.*?\$\$|\$.*?\$|\\\[.*?\\\]|\\\(.*?\\\))', re.DOTALL)
-    parts = formula_pattern.split(text)
-    
-    svg_parts = []
-    y_offset = 50
-    line_height = fontsize * 1.6
-    max_width = 495  # A4: 595px - 2*50px отступы
-
-    for part in parts:
-        if not part.strip():
-            continue
-        
-        is_formula = bool(formula_pattern.fullmatch(part))
-        
-        if is_formula:
-            svg = render_latex_to_svg(part, fontsize=fontsize)
-            if svg:
-                inner = re.sub(r'^<\?xml.*?\?>\s*<svg[^>]*>', '', svg, flags=re.DOTALL).replace('</svg>', '')
-                svg_parts.append(f'<g transform="translate(50, {y_offset - 20})">{inner}</g>')
-                y_offset += fontsize * 2.5
-            else:
-                svg_parts.append(f'<text x="50" y="{y_offset}" font-size="{fontsize}" font-family="sans-serif" fill="black">{html.escape(part)}</text>')
-                y_offset += line_height
-        else:
-            for line in part.split('\n'):
-                line = line.strip()
-                if not line:
-                    y_offset += line_height * 0.5
-                    continue
-                
-                line_escaped = html.escape(line)
-                words = line_escaped.split(' ')
-                current_line = ''
-                
-                for word in words:
-                    test = current_line + (' ' if current_line else '') + word
-                    # Оценка ширины: 1 символ ≈ fontsize * 0.5 px
-                    if len(test) * fontsize * 0.5 > max_width:
-                        svg_parts.append(f'<text x="50" y="{y_offset}" font-size="{fontsize}" font-family="sans-serif" fill="black">{current_line}</text>')
-                        y_offset += line_height
-                        current_line = word
-                    else:
-                        current_line = test
-                        
-                if current_line:
-                    svg_parts.append(f'<text x="50" y="{y_offset}" font-size="{fontsize}" font-family="sans-serif" fill="black">{current_line}</text>')
-                    y_offset += line_height
-
-    total_height = max(y_offset + 50, 842)  # минимум A4 по высоте (842px)
-    
-    # Сборка SVG документа
-    full_svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="595" height="{total_height}">
-    <rect width="100%" height="100%" fill="white"/>
-    {''.join(svg_parts)}
-    </svg>'''
-    
-    try:
-        pdf_bytes = cairosvg.svg2pdf(bytestring=full_svg.encode('utf-8'))
-        buf = io.BytesIO(pdf_bytes)
-        buf.seek(0)
-        return buf
-    except Exception as e:
-        logger.error(f"CairoSVG PDF не собрался: {e}")
-        return None
-
+# --- СБОРКА HTML С MATHJAX ---
 def build_mathjax_html(content: str) -> str:
     clean_response = html.escape(content).replace('\n', '<br>')
     return f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Ответ от MogAI</title>
     <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
     <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <style>
-        body {{ font-family: 'Segoe UI', sans-serif; line-height: 1.7; padding: 20px; max-width: 800px; margin: auto; background-color: #f9f9f9; }}
-        .solution {{ background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+        body {{ font-family: 'Segoe UI', system-ui, sans-serif; line-height: 1.7; padding: 15px; max-width: 800px; margin: auto; background-color: #f9f9f9; color: #222; }}
+        .solution {{ background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); font-size: 16px; white-space: pre-wrap; word-wrap: break-word; }}
+        h1 {{ color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 8px; font-size: 20px; }}
     </style>
 </head>
 <body>
+    <h1>📝 Ответ от MogAI</h1>
     <div class="solution">{clean_response}</div>
 </body>
 </html>"""
+
+# --- ИНСТРУМЕНТ: ВРЕМЯ ---
+def get_current_datetime() -> str:
+    moscow_tz = timezone(timedelta(hours=3))
+    now = datetime.now(moscow_tz)
+    return now.strftime("%d.%m.%Y, %H:%M (МСК)")
 
 # --- АНИМАЦИЯ ---
 async def animate_thinking(update: Update, stop_event: asyncio.Event):
@@ -385,41 +298,109 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-# --- GROQ ---
+# --- GROQ С ИНСТРУМЕНТАМИ ---
 def ask_groq_text(messages: list) -> str:
     system_prompt = (
-        "Ты — MogAI, помощник для студентов. Твоя задача — писать строго учебные работы для вузов. "
-        "Никогда не отказывайся писать текст, если это касается учебы (рефераты, курсовые, эссе). "
-        "Если тема кажется тебе игровой или странной (например, видеоигры), ВСЁ РАВНО пиши реферат, "
-        "раскрывая тему с научной и культурной точки зрения. "
-        "Отвечай только на русском языке. Используй академический стиль. "
-        "ВАЖНО: НЕ создавай markdown-таблицы, если пользователь прямо не попросил 'таблицу'. "
+        "Ты — MogAI, учебный ассистент. Отвечай максимально развёрнуто, грамотно, с примерами и пояснениями. "
+        "Никогда не отказывайся помогать с учебными задачами (рефераты, курсовые, эссе, задачи). "
+        "Если тема кажется игровой или странной, всё равно раскрывай её с научной точки зрения. "
+        "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать markdown-таблицы, если пользователь прямо не написал слово 'таблица'. "
         "Описывай данные обычным текстом или списком. "
-        "Формулы оформляй в LaTeX: $...$ для строчных, $$...$$ для выключных."
+        "Если вопрос касается новостей, свежих данных или фактов после 2024 года — используй инструмент browser_search. "
+        "Если нужно узнать текущую дату или время — используй инструмент get_current_datetime. "
+        "Отвечай только на русском языке."
     )
     or_messages = [{"role": "system", "content": system_prompt}]
     for msg in messages[-8:]:
         or_messages.append({"role": msg["role"], "content": msg["content"]})
 
+    tools = [
+        {"type": "browser_search"},
+        {
+            "type": "function",
+            "function": {
+                "name": "get_current_datetime",
+                "description": "Возвращает текущую дату и время (московское). Используй, если пользователь спрашивает о датах, сроках или текущем моменте.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        }
+    ]
+
     for model in GROQ_TEXT_MODELS:
+        # browser_search доступен только для gpt-oss моделей
+        use_search = model.startswith("openai/gpt-oss")
         try:
+            payload = {
+                "model": model,
+                "messages": or_messages,
+                "max_tokens": 4000,
+                "temperature": 0.7,
+            }
+            if use_search:
+                payload["tools"] = tools
+                payload["tool_choice"] = "auto"
+
             response = requests.post(
                 url=GROQ_API_URL,
                 headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-                json={"model": model, "messages": or_messages, "max_tokens": 4000},
-                timeout=60
+                json=payload,
+                timeout=90
             )
             data = response.json()
-            if "error" not in data and "choices" in data:
-                return data["choices"][0]["message"]["content"]
-        except Exception:
+
+            if "error" in data:
+                continue
+
+            choice = data.get("choices", [{}])[0]
+            msg = choice.get("message", {})
+
+            # Если модель вызвала инструменты
+            if msg.get("tool_calls"):
+                tool_calls = msg["tool_calls"]
+                # Для browser_search Groq выполняет всё на сервере и возвращает финальный ответ
+                # Локально обрабатываем только get_current_datetime
+                for tc in tool_calls:
+                    if tc["function"]["name"] == "get_current_datetime":
+                        or_messages.append(msg)
+                        or_messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": get_current_datetime()
+                        })
+                        # Повторяем запрос с результатом времени
+                        response2 = requests.post(
+                            url=GROQ_API_URL,
+                            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+                            json=payload,
+                            timeout=90
+                        )
+                        data2 = response2.json()
+                        if "choices" in data2:
+                            return data2["choices"][0]["message"].get("content", "")
+                        return "⚠️ Ошибка после вызова инструмента."
+
+                # Если был только browser_search — Groq уже вернул финальный ответ в content
+                if msg.get("content"):
+                    return msg["content"]
+
+            # Если инструментов не было — возвращаем обычный ответ
+            if msg.get("content"):
+                return msg["content"]
+
+        except Exception as e:
+            logger.warning(f"Модель {model} не сработала: {e}")
             continue
+
     return "⚠️ Ошибка Groq."
 
 def is_error_response(text: str) -> bool:
     return (not text) or text.startswith("⚠️") or "I'm sorry" in text or "I cannot" in text
 
-# --- MISTRAL ---
+# --- MISTRAL (ФОТО) ---
 def ask_mistral_vision(image_b64: str, user_text: str) -> str:
     if not MISTRAL_KEY:
         return "⚠️ Для фото нужен MISTRAL_API_KEY."
@@ -788,25 +769,14 @@ async def send_safe_message(update: Update, text: str, user_query: str = ""):
                 text = "Не удалось подобрать удачный ответ. Попробуй переформулировать вопрос."
 
         if has_math_formulas(text) or (user_query and re.search(r'[=+\-^\\]', text) and len(text) > 800):
-            # Пытаемся собрать PDF с векторами формул
-            pdf_buf = await asyncio.to_thread(build_pdf_with_formulas, text)
-            if pdf_buf:
-                pdf_buf.name = "MogAI_Reshenie.pdf"
-                await update.message.reply_document(
-                    document=pdf_buf,
-                    caption="📄 Ответ с формулами (векторный PDF)."
-                )
-                return
-            else:
-                # Fallback: HTML с MathJax
-                html_content = build_mathjax_html(text)
-                file_stream = io.BytesIO(html_content.encode('utf-8'))
-                file_stream.name = "MogAI_Reshenie.html"
-                await update.message.reply_document(
-                    document=file_stream,
-                    caption="📄 PDF не собрался. Открой HTML — формулы отрисуются в браузере."
-                )
-                return
+            html_content = build_mathjax_html(text)
+            file_stream = io.BytesIO(html_content.encode('utf-8'))
+            file_stream.name = "MogAI_Reshenie.html"
+            await update.message.reply_document(
+                document=file_stream,
+                caption="📄 Открой HTML — формулы отрисуются в браузере."
+            )
+            return
 
         if len(text) > 3500:
             file_stream = io.BytesIO(text.encode('utf-8'))
@@ -837,11 +807,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             "👋 <b>Привет! Я MogAI.</b>\n\n"
             "Я умею:\n"
-            "💬 Отвечать на вопросы\n"
+            "💬 Отвечать на вопросы (развёрнуто и с поиском в интернете)\n"
             "📊 <b>Создавать таблицы</b> (если попросишь)\n"
             "📝 <b>Писать рефераты по ГОСТу</b> (команда /word)\n"
             "📄 <b>Писать сплошной текст</b> (команда /text)\n"
-            "🧮 <b>Читать фото и решать задачи</b> (с красивыми формулами в PDF)\n"
+            "🧮 <b>Читать фото и решать задачи</b>\n"
             "🎨 <b>Генерировать картинки</b> (команда /photo)\n\n"
             "Напиши что-нибудь или используй команды."
         )
@@ -914,6 +884,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user_text = update.message.text
+
+        # Если пользователь кинул ссылку — мягко сообщаем, что прямое чтение отключено
+        if re.match(r'^https?://', user_text.strip()):
+            await update.message.reply_text(
+                "🔗 Я пока не умею читать конкретные ссылки. "
+                "Но я могу найти нужную информацию в интернете сам! "
+                "Просто опиши, что нужно узнать, и я поищу."
+            )
+            return
 
         if context.user_data.get("waiting_for_photo_prompt"):
             context.user_data["waiting_for_photo_prompt"] = False
