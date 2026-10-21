@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 URL = os.environ.get("RENDER_EXTERNAL_URL")
 GROQ_KEY = os.environ.get("GROQ_API_KEY")
+MISTRAL_KEY = os.environ.get("MISTRAL_API_KEY")
 
 if not TOKEN or not GROQ_KEY:
     raise ValueError("Не заданы TELEGRAM_TOKEN или GROQ_API_KEY!")
@@ -39,8 +40,9 @@ if not TOKEN or not GROQ_KEY:
 GROQ_TEXT_MODELS = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "openai/gpt-oss-20b"]
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-# Qwen 3.8 27B — идеальна для формул, схем, OCR (через Groq)
-GROQ_VISION_MODEL = "qwen/qwen3.8-27b"
+# Возвращаем Mistral для фото (она не упирается в лимиты)
+MISTRAL_VISION_MODEL = "pixtral-12b-2409"
+MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 
 # --- КЛАВИАТУРЫ ---
 def get_main_keyboard():
@@ -170,11 +172,10 @@ def ask_groq_text(messages: list) -> str:
         except Exception: continue
     return "⚠️ Ошибка Groq."
 
-# --- ЗАПРОСЫ К QWEN (ФОТО) ---
-def ask_vision_model(image_b64: str, user_text: str) -> str:
-    if not GROQ_KEY: return "⚠️ Для фото нужен GROQ_API_KEY."
+# --- ЗАПРОСЫ К MISTRAL (ФОТО) ---
+def ask_mistral_vision(image_b64: str, user_text: str) -> str:
+    if not MISTRAL_KEY: return "⚠️ Для фото нужен MISTRAL_API_KEY."
 
-    # Если вопрос задан, просим ответить на него. Если нет — описать фото.
     if user_text:
         prompt = f"Пользователь прислал фото и спрашивает: '{user_text}'. Внимательно посмотри на фото и ответь на вопрос. Если на фото есть математика или схемы, используй LaTeX для формул."
     else:
@@ -192,15 +193,18 @@ def ask_vision_model(image_b64: str, user_text: str) -> str:
 
     try:
         response = requests.post(
-            url=GROQ_API_URL,
-            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-            json={"model": GROQ_VISION_MODEL, "messages": messages, "max_tokens": 4000},
-            timeout=60
+            url=MISTRAL_API_URL,
+            headers={"Authorization": f"Bearer {MISTRAL_KEY}", "Content-Type": "application/json"},
+            json={"model": MISTRAL_VISION_MODEL, "messages": messages, "max_tokens": 4000},
+            timeout=120
         )
         data = response.json()
-        if "error" in data: return f"⚠️ Ошибка Qwen (фото): {data['error'].get('message')}"
+        if "error" in data: return f"⚠️ Ошибка Mistral (фото): {data['error'].get('message')}"
         return data["choices"][0]["message"]["content"]
-    except Exception as e: return f"⚠️ Сбой Qwen (фото): {e}"
+    except requests.exceptions.Timeout:
+        return "⚠️ Mistral думал слишком долго. Попробуйте сфотографировать меньший участок."
+    except Exception as e: 
+        return f"⚠️ Сбой Mistral (фото): {e}"
 
 # --- СОЗДАНИЕ РЕФЕРАТА ---
 def create_gost_document(topic: str) -> io.BytesIO:
@@ -364,7 +368,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             image_b64 = base64.b64encode(file_bytes).decode("utf-8")
             caption = update.message.caption or ""
             
-            ai_response = await asyncio.to_thread(ask_vision_model, image_b64, caption)
+            ai_response = await asyncio.to_thread(ask_mistral_vision, image_b64, caption)
             
             if stop_event.is_set(): return
             
@@ -383,12 +387,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             # Если пользователь задал вопрос (например, "реши"), то отвечаем текстом в чат
-            # Сначала чистим формулы от лишнего, чтобы они читались в тексте (хотя в Telegram они будут просто текстом)
             clean_response = ai_response.replace('<br>', '\n')
             
             # Если ответ очень длинный (например, решение 10 задач), отправим файлом
             if len(clean_response) > 2000:
-                # Формируем HTML
                 def clean_block(match):
                     block = match.group(1)
                     block = block.replace('\\(', '').replace('\\)', '')
