@@ -10,6 +10,7 @@ import zlib
 import traceback
 import html
 from datetime import datetime, timezone, timedelta
+from urllib.parse import quote
 from docx import Document
 from docx.shared import Pt, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
@@ -44,7 +45,6 @@ if not TOKEN or not GROQ_KEY:
 
 # --- КОНСТАНТЫ ---
 WORDS_PER_PAGE = 280
-# Для поиска используем gpt-oss-20b (поддерживает browser_search)
 GROQ_TEXT_MODELS = ["openai/gpt-oss-20b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 MISTRAL_VISION_MODEL = "pixtral-12b-2409"
@@ -226,34 +226,36 @@ def has_math_formulas(text: str) -> bool:
     ]
     return any(re.search(p, text, re.DOTALL) for p in patterns)
 
-# --- СБОРКА HTML С MATHJAX ---
-def build_mathjax_html(content: str) -> str:
-    clean_response = html.escape(content).replace('\n', '<br>')
-    return f"""<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Ответ от MogAI</title>
-    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
-    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
-    <style>
-        body {{ font-family: 'Segoe UI', system-ui, sans-serif; line-height: 1.7; padding: 15px; max-width: 800px; margin: auto; background-color: #f9f9f9; color: #222; }}
-        .solution {{ background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); font-size: 16px; white-space: pre-wrap; word-wrap: break-word; }}
-        h1 {{ color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 8px; font-size: 20px; }}
-    </style>
-</head>
-<body>
-    <h1>📝 Ответ от MogAI</h1>
-    <div class="solution">{clean_response}</div>
-</body>
-</html>"""
-
-# --- ИНСТРУМЕНТ: ВРЕМЯ ---
+# --- ИНСТРУМЕНТЫ ---
 def get_current_datetime() -> str:
     moscow_tz = timezone(timedelta(hours=3))
     now = datetime.now(moscow_tz)
     return now.strftime("%d.%m.%Y, %H:%M (МСК)")
+
+def search_web(query: str) -> str:
+    """Поиск в интернете через DuckDuckGo (HTML версия)."""
+    try:
+        url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+        
+        # Простой парсинг результатов из HTML
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(r.text, 'html.parser')
+        results = []
+        for a in soup.select('.result__a')[:4]:
+            title = a.get_text(strip=True)
+            link = a.get('href')
+            snippet_el = a.find_parent('.result__body')
+            snippet = snippet_el.select_one('.result__snippet').get_text(strip=True) if snippet_el else ""
+            results.append(f"{title}: {snippet}")
+        
+        if not results:
+            return "Ничего не найдено."
+        return "\n\n".join(results)
+    except Exception as e:
+        return f"Ошибка поиска: {e}"
 
 # --- АНИМАЦИЯ ---
 async def animate_thinking(update: Update, stop_event: asyncio.Event):
@@ -306,7 +308,7 @@ def ask_groq_text(messages: list) -> str:
         "Если тема кажется игровой или странной, всё равно раскрывай её с научной точки зрения. "
         "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать markdown-таблицы, если пользователь прямо не написал слово 'таблица'. "
         "Описывай данные обычным текстом или списком. "
-        "Если вопрос касается новостей, свежих данных или фактов после 2024 года — используй инструмент browser_search. "
+        "Если вопрос касается новостей, свежих данных или фактов после 2024 года — используй инструмент search_web. "
         "Если нужно узнать текущую дату или время — используй инструмент get_current_datetime. "
         "Отвечай только на русском языке."
     )
@@ -315,82 +317,80 @@ def ask_groq_text(messages: list) -> str:
         or_messages.append({"role": msg["role"], "content": msg["content"]})
 
     tools = [
-        {"type": "browser_search"},
         {
             "type": "function",
             "function": {
                 "name": "get_current_datetime",
-                "description": "Возвращает текущую дату и время (московское). Используй, если пользователь спрашивает о датах, сроках или текущем моменте.",
+                "description": "Возвращает текущую дату и время (московское).",
+                "parameters": {"type": "object", "properties": {}, "required": []}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "search_web",
+                "description": "Ищет информацию в интернете. Используй для новостей, свежих данных, фактов.",
                 "parameters": {
                     "type": "object",
-                    "properties": {},
-                    "required": []
+                    "properties": {
+                        "query": {"type": "string", "description": "Поисковый запрос"}
+                    },
+                    "required": ["query"]
                 }
             }
         }
     ]
 
     for model in GROQ_TEXT_MODELS:
-        # browser_search доступен только для gpt-oss моделей
-        use_search = model.startswith("openai/gpt-oss")
         try:
             payload = {
                 "model": model,
                 "messages": or_messages,
                 "max_tokens": 4000,
                 "temperature": 0.7,
+                "tools": tools,
+                "tool_choice": "auto"
             }
-            if use_search:
-                payload["tools"] = tools
-                payload["tool_choice"] = "auto"
 
-            response = requests.post(
-                url=GROQ_API_URL,
-                headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-                json=payload,
-                timeout=90
-            )
-            data = response.json()
+            for _ in range(3):  # Максимум 3 цикла вызова инструментов
+                response = requests.post(
+                    url=GROQ_API_URL,
+                    headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+                    json=payload,
+                    timeout=90
+                )
+                data = response.json()
 
-            if "error" in data:
-                continue
+                if "error" in data:
+                    break
 
-            choice = data.get("choices", [{}])[0]
-            msg = choice.get("message", {})
+                choice = data.get("choices", [{}])[0]
+                msg = choice.get("message", {})
 
-            # Если модель вызвала инструменты
-            if msg.get("tool_calls"):
-                tool_calls = msg["tool_calls"]
-                # Для browser_search Groq выполняет всё на сервере и возвращает финальный ответ
-                # Локально обрабатываем только get_current_datetime
-                for tc in tool_calls:
-                    if tc["function"]["name"] == "get_current_datetime":
-                        or_messages.append(msg)
+                if msg.get("tool_calls"):
+                    or_messages.append(msg)
+                    for tc in msg["tool_calls"]:
+                        name = tc["function"]["name"]
+                        args = json.loads(tc["function"]["arguments"]) if tc["function"].get("arguments") else {}
+                        
+                        if name == "get_current_datetime":
+                            result = get_current_datetime()
+                        elif name == "search_web":
+                            result = search_web(args.get("query", ""))
+                        else:
+                            result = "Инструмент не найден."
+                        
                         or_messages.append({
                             "role": "tool",
                             "tool_call_id": tc["id"],
-                            "content": get_current_datetime()
+                            "content": str(result)
                         })
-                        # Повторяем запрос с результатом времени
-                        response2 = requests.post(
-                            url=GROQ_API_URL,
-                            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-                            json=payload,
-                            timeout=90
-                        )
-                        data2 = response2.json()
-                        if "choices" in data2:
-                            return data2["choices"][0]["message"].get("content", "")
-                        return "⚠️ Ошибка после вызова инструмента."
-
-                # Если был только browser_search — Groq уже вернул финальный ответ в content
+                    payload["messages"] = or_messages
+                    continue  # Повторяем цикл с результатами
+                
                 if msg.get("content"):
                     return msg["content"]
-
-            # Если инструментов не было — возвращаем обычный ответ
-            if msg.get("content"):
-                return msg["content"]
-
+            
         except Exception as e:
             logger.warning(f"Модель {model} не сработала: {e}")
             continue
@@ -768,16 +768,9 @@ async def send_safe_message(update: Update, text: str, user_query: str = ""):
             if not text:
                 text = "Не удалось подобрать удачный ответ. Попробуй переформулировать вопрос."
 
-        if has_math_formulas(text) or (user_query and re.search(r'[=+\-^\\]', text) and len(text) > 800):
-            html_content = build_mathjax_html(text)
-            file_stream = io.BytesIO(html_content.encode('utf-8'))
-            file_stream.name = "MogAI_Reshenie.html"
-            await update.message.reply_document(
-                document=file_stream,
-                caption="📄 Открой HTML — формулы отрисуются в браузере."
-            )
-            return
-
+        # Если есть формулы — добавляем ссылку на визуализатор, а не отправляем файл
+        has_math = has_math_formulas(text)
+        
         if len(text) > 3500:
             file_stream = io.BytesIO(text.encode('utf-8'))
             file_stream.name = "MogAI_Otvet.txt"
@@ -785,6 +778,10 @@ async def send_safe_message(update: Update, text: str, user_query: str = ""):
             return
 
         formatted_text = format_text_for_telegram(text)
+        
+        if has_math:
+            formatted_text += "\n\n💡 <i>Чтобы увидеть формулы красиво, скопируй их и вставь на сайт:</i> https://www.codecogs.com/latex/eqneditor.php"
+            
         if not formatted_text.strip():
             return
         try:
@@ -807,7 +804,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             "👋 <b>Привет! Я MogAI.</b>\n\n"
             "Я умею:\n"
-            "💬 Отвечать на вопросы (развёрнуто и с поиском в интернете)\n"
+            "💬 Отвечать на вопросы (с поиском в интернете)\n"
             "📊 <b>Создавать таблицы</b> (если попросишь)\n"
             "📝 <b>Писать рефераты по ГОСТу</b> (команда /word)\n"
             "📄 <b>Писать сплошной текст</b> (команда /text)\n"
@@ -885,7 +882,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user_text = update.message.text
 
-        # Если пользователь кинул ссылку — мягко сообщаем, что прямое чтение отключено
         if re.match(r'^https?://', user_text.strip()):
             await update.message.reply_text(
                 "🔗 Я пока не умею читать конкретные ссылки. "
@@ -1104,4 +1100,4 @@ if __name__ == "__main__":
         url_path=TOKEN,
         webhook_url=f"{URL}/{TOKEN}",
         drop_pending_updates=False,
-        )
+)
