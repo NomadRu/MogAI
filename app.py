@@ -9,7 +9,7 @@ import time
 import traceback
 from docx import Document
 from docx.shared import Pt, Cm
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING, WD_BREAK
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
@@ -245,12 +245,14 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
         f"Напиши академический реферат для студента вуза на тему: '{topic}'. "
         f"Это обязательная учебная работа. Объем: примерно {words_needed} слов. "
         "Структура: Введение (актуальность, цель, задачи), "
-        "Основная часть (3 главы, в каждой 2 подглавы), Заключение, Список литературы. "
+        "Основная часть (3 главы с названиями, в каждой 2 подглавы с названиями), "
+        "Заключение, Список литературы. "
         "Пиши от третьего лица, академическим языком. "
         "ВАЖНО: В конце каждой подглавы и главы добавь небольшой абзац (2-3 предложения) с личным отношением к теме от первого лица (например, 'На мой взгляд...', 'Я считаю, что...'). "
         "НЕ пиши заголовок 'Мнение автора:', просто начни абзац с личного мнения. "
-        "Не используй Markdown. Заголовки пиши с новой строки ЗАГЛАВНЫМИ буквами. "
-        "Подзаголовки пиши с новой строки, начиная с номера (например, 1.1 Название). "
+        "Не используй Markdown. Заголовки пиши с новой строки. "
+        "Главы оформляй так: 'ГЛАВА 1. НАЗВАНИЕ ГЛАВЫ' (заглавными буквами). "
+        "Подзаголовки оформляй так: '1.1 НАЗВАНИЕ ПОДГЛАВЫ' (с новой строки). "
         "В конце ОБЯЗАТЕЛЬНО сделай раздел 'СПИСОК ЛИТЕРАТУРЫ' с 10 источниками, изданными не позднее 2021 года."
     )
     raw_text = ask_groq_text([{"role": "user", "content": prompt}])
@@ -322,7 +324,6 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
         
         for _ in range(6): doc.add_paragraph()
         
-        # ИСПРАВЛЕННЫЙ БЛОК
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
         p.add_run(f"Выполнил: обучающийся\nгруппы {group}\n{student_name}")
         
@@ -341,6 +342,7 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
         p.add_run("СОДЕРЖАНИЕ").bold = True
         doc.add_paragraph()
         
+        # Базовые пункты для оглавления
         toc_items = [
             ("ВВЕДЕНИЕ", "bookmark_intro"),
             ("ГЛАВА 1.", "bookmark_ch1"),
@@ -356,6 +358,9 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
             ("СПИСОК ЛИТЕРАТУРЫ", "bookmark_refs")
         ]
         
+        # Мы не можем заранее знать названия глав, поэтому в оглавлении будут только номера,
+        # но в самом тексте названия будут.
+        
         for title, bookmark in toc_items:
             p = doc.add_paragraph()
             p.paragraph_format.line_spacing_rule = WD_LINE_SPACING.ONE_POINT_FIVE
@@ -369,27 +374,43 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str, 
 
         # --- ОСНОВНОЙ ТЕКСТ ---
         lines = raw_text.split('\n')
+        
+        # Флаг для отслеживания, нужно ли ставить разрыв страницы
+        need_page_break = False
+        
         for line in lines:
             line = line.strip()
             if not line: continue
             
-            is_heading = len(line) < 60 and (line.isupper() or line.startswith("ГЛАВА") or line.startswith("ВВЕДЕНИЕ") or line.startswith("ЗАКЛЮЧЕНИЕ"))
-            is_subheading = re.match(r'^\d+\.\d+', line) and len(line) < 100
+            # Проверяем, является ли строка заголовком главы или раздела
+            is_chapter = line.upper().startswith("ГЛАВА")
+            is_section = line.upper() in ["ВВЕДЕНИЕ", "ЗАКЛЮЧЕНИЕ", "СПИСОК ЛИТЕРАТУРЫ", "СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ"]
+            is_subheading = re.match(r'^\d+\.\d+', line)
             
-            if is_heading:
+            # Если это начало нового раздела — ставим разрыв страницы
+            if is_chapter or is_section:
+                if not need_page_break:
+                    # Первый разрыв не нужен, так как мы уже сделали add_page_break после оглавления
+                    # Но если это Введение, то оно идет сразу после оглавления
+                    if line.upper() != "ВВЕДЕНИЕ":
+                        doc.add_page_break()
+                    need_page_break = True
+                
                 p = add_paragraph(line, is_heading=True)
                 bookmark_name = f"bookmark_{line[:10].replace(' ', '_').replace('.', '_')}"
                 add_bookmark(p, bookmark_name)
                 doc.add_paragraph()
+            
             elif is_subheading:
-                p = add_paragraph(line, is_heading=False, is_bold=True)
+                p = add_paragraph(line, is_bold=True)
                 bookmark_name = f"bookmark_{line[:10].replace(' ', '_').replace('.', '_')}"
                 add_bookmark(p, bookmark_name)
                 doc.add_paragraph()
+            
             else:
                 add_paragraph(line)
 
-        # --- СПИСОК ЛИТЕРАТУРЫ (10 ИСТОЧНИКОВ) ---
+        # --- СПИСОК ЛИТЕРАТУРЫ ---
         if "СПИСОК ЛИТЕРАТУРЫ" not in raw_text.upper() and "СПИСОК ИСПОЛЬЗОВАННЫХ" not in raw_text.upper():
             doc.add_page_break()
             p = add_paragraph("СПИСОК ЛИТЕРАТУРЫ", is_heading=True)
