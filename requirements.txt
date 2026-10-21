@@ -4,3 +4,4 @@ matplotlib
 python-docx
 weasyprint==62.3
 pypdf==4.2.0
+cairosvg
