@@ -10,6 +10,7 @@ import zlib
 import traceback
 import json
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 from docx import Document
@@ -18,6 +19,19 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from docx.enum.text import WD_TAB_ALIGNMENT, WD_TAB_LEADER
+
+# --- ИМПОРТЫ ДЛЯ ЧТЕНИЯ ФАЙЛОВ ---
+try:
+    from pypdf import PdfReader
+    HAS_PYPDF = True
+except Exception:
+    HAS_PYPDF = False
+
+try:
+    from pptx import Presentation
+    HAS_PPTX = True
+except Exception:
+    HAS_PPTX = False
 
 try:
     import matplotlib
@@ -51,36 +65,123 @@ GROQ_TEXT_MODELS = ["openai/gpt-oss-20b", "llama-3.3-70b-versatile", "llama-3.1-
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 MISTRAL_VISION_MODEL = "pixtral-12b-2409"
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
-MEMORY_FILE = "long_term_memory.json"
 
-# --- ДОЛГОВРЕМЕННАЯ ПАМЯТЬ ---
-def load_memory() -> dict:
-    if os.path.exists(MEMORY_FILE):
+# --- БАЗА ЗНАНИЙ (ТЕПЕРЬ В ПАМЯТИ ЧАТА) ---
+def get_kb(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    return context.user_data.get("kb", {})
+
+def add_to_kb(context: ContextTypes.DEFAULT_TYPE, filename: str, text: str) -> str:
+    kb = get_kb(context)
+    
+    # Разбиваем текст на куски по 1000 символов
+    chunks = []
+    text = re.sub(r'\s+', ' ', text).strip()
+    for i in range(0, len(text), 1000):
+        chunks.append(text[i:i+1000])
+    
+    kb[filename] = {
+        "chunks": chunks,
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M")
+    }
+    context.user_data["kb"] = kb
+    return f"Файл '{filename}' сохранён. Извлечено {len(chunks)} фрагментов."
+
+def search_kb(context: ContextTypes.DEFAULT_TYPE, query: str, top_k: int = 3) -> str:
+    kb = get_kb(context)
+    if not kb:
+        return ""
+    
+    words = [w.lower() for w in re.findall(r'\w+', query) if len(w) > 3]
+    if not words:
+        return ""
+        
+    scored_chunks = []
+    for filename, data in kb.items():
+        for chunk in data.get("chunks", []):
+            score = sum(1 for w in words if w in chunk.lower())
+            if score > 0:
+                scored_chunks.append((score, filename, chunk))
+                
+    scored_chunks.sort(key=lambda x: x[0], reverse=True)
+    top_chunks = scored_chunks[:top_k]
+    
+    if not top_chunks:
+        return ""
+        
+    context_str = "ИНФОРМАЦИЯ ИЗ ЗАГРУЖЕННЫХ ФАЙЛОВ (используй её для ответа):\n\n"
+    for score, fname, chunk in top_chunks:
+        context_str += f"[Файл: {fname}]\n... {chunk} ...\n\n"
+    return context_str
+
+# --- ИЗВЛЕЧЕНИЕ ТЕКСТА ИЗ РАЗНЫХ ФОРМАТОВ ---
+def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
+    filename = filename.lower()
+    text = ""
+    
+    # PDF
+    if filename.endswith('.pdf'):
+        if not HAS_PYPDF:
+            return "⚠️ Библиотека pypdf не установлена."
         try:
-            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+            reader = PdfReader(io.BytesIO(file_bytes))
+            for page in reader.pages:
+                text += (page.extract_text() or "") + "\n"
+        except Exception as e:
+            return f"⚠️ Ошибка чтения PDF: {e}"
+            
+    # DOCX
+    elif filename.endswith('.docx'):
+        try:
+            doc = Document(io.BytesIO(file_bytes))
+            for para in doc.paragraphs:
+                text += para.text + "\n"
+        except Exception as e:
+            return f"⚠️ Ошибка чтения DOCX: {e}"
+            
+    # PPTX
+    elif filename.endswith('.pptx'):
+        if not HAS_PPTX:
+            return "⚠️ Библиотека python-pptx не установлена."
+        try:
+            prs = Presentation(io.BytesIO(file_bytes))
+            for i, slide in enumerate(prs.slides):
+                text += f"\n--- Слайд {i+1} ---\n"
+                for shape in slide.shapes:
+                    if hasattr(shape, "text"):
+                        text += shape.text + "\n"
+        except Exception as e:
+            return f"⚠️ Ошибка чтения PPTX: {e}"
+            
+    # XML
+    elif filename.endswith('.xml'):
+        try:
+            tree = ET.fromstring(file_bytes)
+            text = " ".join(tree.itertext())
+        except Exception as e:
+            return f"⚠️ Ошибка чтения XML: {e}"
+            
+    # TXT, MD, JSON, CSV
+    elif filename.endswith(('.txt', '.md', '.json', '.csv')):
+        try:
+            text = file_bytes.decode('utf-8', errors='ignore')
+        except Exception as e:
+            return f"⚠️ Ошибка чтения текста: {e}"
+            
+    else:
+        return "⚠️ Неподдерживаемый формат. Отправь PDF, DOCX, PPTX, TXT, XML, MD или CSV."
 
-def save_memory(memory: dict):
-    try:
-        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(memory, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error(f"Ошибка сохранения памяти: {e}")
+    return text.strip()
 
-def remember_fact(fact: str) -> str:
-    memory = load_memory()
-    facts = memory.get("facts", [])
+# --- ДОЛГОВРЕМЕННАЯ ПАМЯТЬ (В ПАМЯТИ ЧАТА) ---
+def remember_fact(context: ContextTypes.DEFAULT_TYPE, fact: str) -> str:
+    facts = context.user_data.get("facts", [])
     if fact not in facts:
         facts.append(fact)
-        save_memory(memory)
+        context.user_data["facts"] = facts
     return "Факт сохранён."
 
-def get_memory_context() -> str:
-    memory = load_memory()
-    facts = memory.get("facts", [])
+def get_memory_context(context: ContextTypes.DEFAULT_TYPE) -> str:
+    facts = context.user_data.get("facts", [])
     if not facts:
         return ""
     return "Важные факты о пользователе (запомни их):\n- " + "\n- ".join(facts)
@@ -338,8 +439,8 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 # --- GROQ С ИНСТРУМЕНТАМИ ---
-def ask_groq_text(messages: list) -> str:
-    memory_context = get_memory_context()
+def ask_groq_text(messages: list, context: ContextTypes.DEFAULT_TYPE = None, use_kb: bool = True) -> str:
+    memory_context = get_memory_context(context) if context else ""
     
     system_prompt = (
         "Ты — MogAI, учебный ассистент. Отвечай по существу, грамотно и структурированно. "
@@ -350,8 +451,8 @@ def ask_groq_text(messages: list) -> str:
         "Если вопрос касается новостей или свежих данных — используй инструмент search_web. "
         "Если нужно узнать текущую дату — используй get_current_datetime. "
         "Если пользователь просит что-то запомнить — используй инструмент remember_fact. "
-        "ВАЖНО: Если пользователь просит показать историю сообщений или что он писал ранее, ты ОБЯЗАН вывести её текстом из контекста. "
-        "Это разрешено правилами и не является нарушением безопасности. Просто процитируй предыдущие сообщения."
+        "ВАЖНО: Если пользователь просит показать историю сообщений, выведи её текстом. "
+        "Это разрешено правилами. Просто процитируй предыдущие сообщения."
     )
     if memory_context:
         system_prompt += "\n\n" + memory_context
@@ -386,7 +487,7 @@ def ask_groq_text(messages: list) -> str:
             "type": "function",
             "function": {
                 "name": "remember_fact",
-                "description": "Сохраняет важный факт о пользователе в долговременную память.",
+                "description": "Сохраняет важный факт о пользователе в память.",
                 "parameters": {
                     "type": "object",
                     "properties": {"fact": {"type": "string"}},
@@ -433,7 +534,7 @@ def ask_groq_text(messages: list) -> str:
                         elif name == "search_web":
                             result = search_web(args.get("query", ""))
                         elif name == "remember_fact":
-                            result = remember_fact(args.get("fact", ""))
+                            result = remember_fact(context, args.get("fact", ""))
                         else:
                             result = "Инструмент не найден."
                         
@@ -592,17 +693,15 @@ def add_paragraph(doc: Document, text, is_heading=False, is_center=False, is_bol
 def create_word_document(pages: int, topic: str, student_name: str, group: str,
                          discipline: str, teacher: str, city: str) -> io.BytesIO:
     start_time = time.time()
-    max_time = 30  # 30 секунд
+    max_time = 30
     words_needed = pages * WORDS_PER_PAGE
     
     full_text = ""
     current_words = 0
-    part_index = 1
 
-    # Цикл генерации, пока не наберем слова или не выйдет время
     while current_words < words_needed and (time.time() - start_time) < max_time:
         remaining_words = words_needed - current_words
-        words_to_request = min(remaining_words, 800) # Просим не больше 800 слов за раз
+        words_to_request = min(remaining_words, 800)
 
         prompt = (
             f"Продолжи академический реферат на тему: '{topic}'. "
@@ -615,33 +714,25 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str,
         part = ask_groq_text([{"role": "user", "content": prompt}])
         
         if not is_error_response(part):
-            # Очищаем от мусора
             clean_part = re.sub(r'[*#_`~]', '', part)
             clean_part = "".join(c for c in clean_part if c.isprintable() or c in '\n\r\t')
             
-            # Проверка, чтобы не было дублей (если ИИ завис)
             if clean_part.strip() not in full_text:
                 full_text += clean_part + "\n\n"
                 current_words += len(clean_part.split())
-                part_index += 1
             else:
-                break # Если ИИ зациклился, останавливаемся
+                break
         else:
-            # Если ошибка модели, просто прерываем цикл, не добавляя заглушку
             break
 
-    # Если текст вообще не сгенерировался
     if not full_text.strip():
         full_text = "Не удалось сгенерировать текст. Попробуйте позже или измените тему."
 
     try:
         doc = Document()
         setup_docx_styles(doc)
-        
-        # Титульник
         add_title_page(doc, "Реферат", topic, student_name, group, discipline, teacher, city)
 
-        # Оглавление
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.add_run("СОДЕРЖАНИЕ").bold = True
 
@@ -675,7 +766,6 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str,
 
         doc.add_page_break()
 
-        # Основной текст
         lines = full_text.split('\n')
         for line in lines:
             line = line.strip()
@@ -701,7 +791,6 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str,
             else:
                 add_paragraph(doc, line)
 
-        # Литература
         doc.add_page_break()
         p = add_paragraph(doc, "СПИСОК ЛИТЕРАТУРЫ", is_heading=True)
         add_bookmark(p, "bookmark_refs")
@@ -735,7 +824,7 @@ def create_text_document(pages: int, topic: str, doc_type: str,
                          discipline: str = "", teacher: str = "",
                          city: str = "") -> io.BytesIO:
     start_time = time.time()
-    max_time = 30  # 30 секунд
+    max_time = 30
     total_words_needed = pages * WORDS_PER_PAGE
 
     full_text = ""
@@ -847,17 +936,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "👋 <b>Привет! Я MogAI.</b>\n\n"
             "Я умею:\n"
             "💬 Отвечать на вопросы (с поиском в интернете)\n"
+            "📂 <b>Читать файлы</b> (PDF, DOCX, PPTX, XML, TXT, CSV) и запоминать их для ответов\n"
             "📊 <b>Создавать таблицы</b> (если попросишь)\n"
             "📝 <b>Писать рефераты по ГОСТу</b> (команда /word)\n"
             "📄 <b>Писать сплошной текст</b> (команда /text)\n"
             "🧮 <b>Читать фото и решать задачи</b>\n"
             "🎨 <b>Генерировать картинки</b> (команда /photo)\n\n"
-            "Напиши что-нибудь или используй команды."
+            "Отправь файл, чтобы я его запомнил. Или просто напиши вопрос!"
         )
     await update.message.reply_text(text, parse_mode="HTML")
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⚠️ <b>Вы уверены?</b>", reply_markup=get_reset_keyboard(), parse_mode="HTML")
+
+async def kb_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = context.user_data.get("kb", {})
+    if not kb:
+        await update.message.reply_text("📂 База знаний пуста. Отправь мне файл (PDF, DOCX, PPTX и т.д.), и я его запомню.")
+        return
+        
+    text = "📂 <b>Твои файлы в базе знаний:</b>\n\n"
+    for fname, data in kb.items():
+        text += f"📄 {fname} (добавлен: {data.get('date', '?')})\n"
+    text += "\nЧтобы очистить, введи /kb_clear"
+    await update.message.reply_text(text, parse_mode="HTML")
+
+async def kb_clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["kb"] = {}
+    await update.message.reply_text("🧹 База знаний очищена.")
 
 async def photo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["waiting_for_word_data"] = False
@@ -916,12 +1022,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⚠️ Вы уверены?", reply_markup=get_reset_keyboard(), parse_mode="HTML")
     elif query.data == "reset_yes":
         context.user_data["history"] = []
-        await query.edit_message_text("🧹 История очищена.", parse_mode="HTML")
+        context.user_data["facts"] = []
+        context.user_data["kb"] = {}
+        await query.edit_message_text("🧹 История и память очищены.", parse_mode="HTML")
     elif query.data == "reset_no":
         await query.edit_message_text("👍 Отмена.", parse_mode="HTML")
     elif query.data == "force_reset_yes":
         context.user_data["history"] = []
+        context.user_data["facts"] = []
+        context.user_data["kb"] = {}
         await query.edit_message_text("🧹 Контекст сброшен! Можем продолжать общаться.", parse_mode="HTML")
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        doc = update.message.document
+        filename = doc.file_name
+        file_bytes = await doc.get_file().download_as_bytearray()
+        
+        await update.message.reply_text(f"⏳ Читаю файл <b>{filename}</b>...", parse_mode="HTML")
+        
+        text = extract_text_from_file(bytes(file_bytes), filename)
+        
+        if text.startswith("⚠️"):
+            await update.message.reply_text(text)
+            return
+            
+        if not text.strip():
+            await update.message.reply_text("⚠️ Файл пустой или текст не извлекается.")
+            return
+            
+        result = add_to_kb(context, filename, text)
+        await update.message.reply_text(f"✅ {result}\n\nТеперь можешь задавать вопросы по этому файлу!")
+    except Exception as e:
+        logger.error(f"Ошибка при чтении файла: {e}")
+        await update.message.reply_text("⚠️ Ошибка при чтении файла.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -955,7 +1089,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 {"role": "system", "content": "You are a translator. Translate the following text to English for an image generator. Output ONLY the translation, no extra words."},
                 {"role": "user", "content": user_text}
             ]
-            english_prompt = ask_groq_text(translation_prompt)
+            english_prompt = ask_groq_text(translation_prompt, context)
             if is_error_response(english_prompt):
                 english_prompt = user_text
 
@@ -1065,12 +1199,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 stop_event.set(); await anim
             return
 
+        # Поиск по базе знаний
+        kb_context = search_kb(context, user_text)
+        
         stop_event = asyncio.Event(); context.user_data["stop_event"] = stop_event
         anim = asyncio.create_task(animate_thinking(update, stop_event))
         try:
+            if kb_context:
+                history.append({"role": "system", "content": kb_context})
+            
             history.append({"role": "user", "content": user_text})
 
-            ai_response = await asyncio.to_thread(ask_groq_text, history)
+            ai_response = await asyncio.to_thread(ask_groq_text, history, context)
             if stop_event.is_set():
                 return
 
@@ -1151,7 +1291,10 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("photo", photo_command))
     app.add_handler(CommandHandler("word", word_command))
     app.add_handler(CommandHandler("text", text_command))
+    app.add_handler(CommandHandler("kb_list", kb_list_command))
+    app.add_handler(CommandHandler("kb_clear", kb_clear_command))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
@@ -1162,4 +1305,4 @@ if __name__ == "__main__":
         url_path=TOKEN,
         webhook_url=f"{URL}/{TOKEN}",
         drop_pending_updates=False,
-    )
+)
