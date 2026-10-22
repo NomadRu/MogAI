@@ -9,6 +9,7 @@ import secrets
 import zlib
 import traceback
 import json
+import time
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 from docx import Document
@@ -74,7 +75,6 @@ def remember_fact(fact: str) -> str:
     facts = memory.get("facts", [])
     if fact not in facts:
         facts.append(fact)
-        memory["facts"] = facts
         save_memory(memory)
     return "Факт сохранён."
 
@@ -341,7 +341,6 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def ask_groq_text(messages: list) -> str:
     memory_context = get_memory_context()
     
-    # ЖЕСТКИЙ ПРОМПТ ДЛЯ СНЯТИЯ ОГРАНИЧЕНИЙ
     system_prompt = (
         "Ты — MogAI, учебный ассистент. Отвечай по существу, грамотно и структурированно. "
         "НЕ ЛЕЙ ВОДУ. Если вопрос простой — отвечай коротко (1-2 предложения). "
@@ -589,61 +588,60 @@ def add_paragraph(doc: Document, text, is_heading=False, is_center=False, is_bol
         p.add_run(text)
     return p
 
-# --- СОЗДАНИЕ РЕФЕРАТА ---
+# --- СОЗДАНИЕ РЕФЕРАТА (БЕЗ ЗАГЛУШЕК) ---
 def create_word_document(pages: int, topic: str, student_name: str, group: str,
                          discipline: str, teacher: str, city: str) -> io.BytesIO:
+    start_time = time.time()
+    max_time = 30  # 30 секунд
     words_needed = pages * WORDS_PER_PAGE
+    
+    full_text = ""
+    current_words = 0
+    part_index = 1
 
-    prompt1 = (
-        f"Напиши первую часть академического реферата на тему: '{topic}'. "
-        f"Объем: примерно {words_needed // 3} слов. "
-        "Начни с ВВЕДЕНИЯ (актуальность, цель, задачи) и напиши ГЛАВУ 1 с 2 подглавами. "
-        "Пиши от третьего лица, академическим языком. "
-        "В конце каждой подглавы добавь 2-3 предложения с личным мнением от первого лица. "
-        "НЕ пиши заголовок 'Мнение автора:'. "
-        "Не используй Markdown. Заголовки пиши с новой строки. "
-        "Главы оформляй так: 'ГЛАВА 1. НАЗВАНИЕ' (заглавными). Подзаголовки: '1.1 НАЗВАНИЕ'."
-    )
-    part1 = ask_groq_text([{"role": "user", "content": prompt1}])
+    # Цикл генерации, пока не наберем слова или не выйдет время
+    while current_words < words_needed and (time.time() - start_time) < max_time:
+        remaining_words = words_needed - current_words
+        words_to_request = min(remaining_words, 800) # Просим не больше 800 слов за раз
 
-    prompt2 = (
-        f"Продолжи академический реферат на тему: '{topic}'. Напиши ГЛАВУ 2 с 2 подглавами. "
-        f"Объем: примерно {words_needed // 3} слов. "
-        "Пиши от третьего лица, академическим языком. "
-        "В конце каждой подглавы добавь 2-3 предложения с личным мнением от первого лица. "
-        "НЕ пиши заголовок 'Мнение автора:'. "
-        "Не используй Markdown. Заголовки пиши с новой строки. "
-        "Главу оформляй так: 'ГЛАВА 2. НАЗВАНИЕ' (заглавными). Подзаголовки: '2.1 НАЗВАНИЕ'."
-    )
-    part2 = ask_groq_text([{"role": "user", "content": prompt2}])
+        prompt = (
+            f"Продолжи академический реферат на тему: '{topic}'. "
+            f"Напиши ровно {words_to_request} слов связного текста. "
+            "Пиши от третьего лица, академическим языком. "
+            "Не используй списки и заголовки. Без Markdown. "
+            "Если это конец, сделай выводы."
+        )
+        
+        part = ask_groq_text([{"role": "user", "content": prompt}])
+        
+        if not is_error_response(part):
+            # Очищаем от мусора
+            clean_part = re.sub(r'[*#_`~]', '', part)
+            clean_part = "".join(c for c in clean_part if c.isprintable() or c in '\n\r\t')
+            
+            # Проверка, чтобы не было дублей (если ИИ завис)
+            if clean_part.strip() not in full_text:
+                full_text += clean_part + "\n\n"
+                current_words += len(clean_part.split())
+                part_index += 1
+            else:
+                break # Если ИИ зациклился, останавливаемся
+        else:
+            # Если ошибка модели, просто прерываем цикл, не добавляя заглушку
+            break
 
-    prompt3 = (
-        f"Заверши академический реферат на тему: '{topic}'. Напиши ГЛАВУ 3 с 2 подглавами и ЗАКЛЮЧЕНИЕ. "
-        f"Объем: примерно {words_needed // 3} слов. "
-        "Пиши от третьего лица, академическим языком. "
-        "В конце каждой подглавы добавь 2-3 предложения с личным мнением от первого лица. "
-        "НЕ пиши заголовок 'Мнение автора:'. "
-        "Не используй Markdown. Заголовки пиши с новой строки. "
-        "Главу оформляй так: 'ГЛАВА 3. НАЗВАНИЕ' (заглавными). Подзаголовки: '3.1 НАЗВАНИЕ'."
-    )
-    part3 = ask_groq_text([{"role": "user", "content": prompt3}])
-
-    if is_error_response(part1):
-        part1 = f"ВВЕДЕНИЕ\nТема '{topic}' актуальна.\nГЛАВА 1. ОСНОВЫ\n1.1 Начало\nТекст..."
-    if is_error_response(part2):
-        part2 = f"ГЛАВА 2. АНАЛИЗ\n2.1 Суть\nТекст...\n2.2 Детали\nТекст..."
-    if is_error_response(part3):
-        part3 = f"ГЛАВА 3. ПРАКТИКА\n3.1 Примеры\nТекст...\nЗАКЛЮЧЕНИЕ\nВыводы..."
-
-    full_text = part1 + "\n" + part2 + "\n" + part3
-    full_text = re.sub(r'[*#_`~]', '', full_text)
-    full_text = "".join(c for c in full_text if c.isprintable() or c in '\n\r\t')
+    # Если текст вообще не сгенерировался
+    if not full_text.strip():
+        full_text = "Не удалось сгенерировать текст. Попробуйте позже или измените тему."
 
     try:
         doc = Document()
         setup_docx_styles(doc)
+        
+        # Титульник
         add_title_page(doc, "Реферат", topic, student_name, group, discipline, teacher, city)
 
+        # Оглавление
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.add_run("СОДЕРЖАНИЕ").bold = True
 
@@ -677,6 +675,7 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str,
 
         doc.add_page_break()
 
+        # Основной текст
         lines = full_text.split('\n')
         for line in lines:
             line = line.strip()
@@ -702,6 +701,7 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str,
             else:
                 add_paragraph(doc, line)
 
+        # Литература
         doc.add_page_break()
         p = add_paragraph(doc, "СПИСОК ЛИТЕРАТУРЫ", is_heading=True)
         add_bookmark(p, "bookmark_refs")
@@ -729,60 +729,45 @@ def create_word_document(pages: int, topic: str, student_name: str, group: str,
         logger.error(f"Ошибка сборки Word: {e}")
         return None
 
-# --- СПЛОШНОЙ ТЕКСТ ---
+# --- СПЛОШНОЙ ТЕКСТ (БЕЗ ЗАГЛУШЕК) ---
 def create_text_document(pages: int, topic: str, doc_type: str,
                          student_name: str = "", group: str = "",
                          discipline: str = "", teacher: str = "",
                          city: str = "") -> io.BytesIO:
+    start_time = time.time()
+    max_time = 30  # 30 секунд
     total_words_needed = pages * WORDS_PER_PAGE
-    chunk_size = 3
-    chunks = (pages + chunk_size - 1) // chunk_size
 
     full_text = ""
     current_words = 0
 
-    for i in range(chunks):
-        words_for_chunk = min(chunk_size * WORDS_PER_PAGE, total_words_needed - current_words)
-        if words_for_chunk <= 0:
-            break
+    while current_words < total_words_needed and (time.time() - start_time) < max_time:
+        remaining_words = total_words_needed - current_words
+        words_to_request = min(remaining_words, 800)
 
-        if i == 0:
-            prompt = (
-                f"Напиши начало {doc_type} на тему: '{topic}'. "
-                f"Объем: примерно {words_for_chunk} слов (это {chunk_size} страниц). "
-                "Пиши связным академическим текстом, без заголовков и списков, как сплошной текст. "
-                "Раскрой актуальность и основные понятия."
-            )
-        elif i == chunks - 1:
-            prompt = (
-                f"Заверши {doc_type} на тему: '{topic}'. "
-                f"Объем: примерно {words_for_chunk} слов (это последние страницы). "
-                "Пиши связным академическим текстом. Сделай выводы и заключение."
-            )
-        else:
-            prompt = (
-                f"Продолжи {doc_type} на тему: '{topic}'. "
-                f"Объем: примерно {words_for_chunk} слов. "
-                "Пиши связным академическим текстом, без заголовков и списков. "
-                "Продолжи анализ темы, раскрой детали."
-            )
+        prompt = (
+            f"Продолжи {doc_type} на тему: '{topic}'. "
+            f"Напиши ровно {words_to_request} слов связного академического текста. "
+            "Без заголовков, списков и Markdown. Просто текст. "
+            "Если это конец, сделай выводы."
+        )
 
         part = ask_groq_text([{"role": "user", "content": prompt}])
 
         if not is_error_response(part):
-            full_text += part + "\n\n"
-            current_words += len(part.split())
+            clean_part = re.sub(r'[*#_`~]', '', part)
+            clean_part = "".join(c for c in clean_part if c.isprintable() or c in '\n\r\t')
+
+            if clean_part.strip() not in full_text:
+                full_text += clean_part + "\n\n"
+                current_words += len(clean_part.split())
+            else:
+                break
         else:
-            stub = f"Текст по теме '{topic}'. " * 100
-            full_text += stub + "\n\n"
-            current_words += len(stub.split())
+            break
 
-    if current_words < total_words_needed:
-        stub = f"Дополнительный текст по теме '{topic}'. " * 100
-        full_text += stub + "\n\n"
-
-    full_text = re.sub(r'[*#_`~]', '', full_text)
-    full_text = "".join(c for c in full_text if c.isprintable() or c in '\n\r\t')
+    if not full_text.strip():
+        full_text = "Не удалось сгенерировать текст. Попробуйте позже."
 
     try:
         doc = Document()
@@ -1105,7 +1090,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        # Проверка на лимит
         history = context.user_data.get("history", [])
         if len(history) >= MAX_HISTORY:
             await update.message.reply_text(
@@ -1178,4 +1162,4 @@ if __name__ == "__main__":
         url_path=TOKEN,
         webhook_url=f"{URL}/{TOKEN}",
         drop_pending_updates=False,
-        )
+    )
